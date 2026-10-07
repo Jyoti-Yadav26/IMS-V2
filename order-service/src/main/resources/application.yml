@@ -21,8 +21,11 @@ spring:
     bootstrap-servers: ${KAFKA_BROKER:localhost:9092}
   cloud:
     openfeign:
+      # Off: the explicit @CircuitBreaker/@Retry on InventoryClientAdapter is the single
+      # resilience layer. Feign's own wrapper would add a second, separately-configured
+      # breaker around the same calls.
       circuitbreaker:
-        enabled: true
+        enabled: false
 
 eureka:
   client:
@@ -32,7 +35,10 @@ eureka:
     prefer-ip-address: true
 
 resilience4j:
+  # Lower aspect order = outer. The default is the reverse (retry outermost), which lets the
+  # inner breaker's fallback convert the first failure before retry can make a second attempt.
   circuitbreaker:
+    circuit-breaker-aspect-order: 1
     instances:
       inventoryService:
         register-health-indicator: true
@@ -49,17 +55,19 @@ resilience4j:
           - com.ims.order.exception.InsufficientStockException
           - com.ims.order.exception.ProductNotFoundException
   retry:
+    retry-aspect-order: 2
     instances:
       inventoryService:
         max-attempts: 3
         wait-duration: 300ms
         enable-exponential-backoff: true
         exponential-backoff-multiplier: 2
+        # Only business rejections. CallNotPermittedException and
+        # InventoryServiceUnavailableException both originate in the outer breaker layer, so
+        # the retry aspect never sees them; listing them here used to suppress every retry.
         ignore-exceptions:
           - com.ims.order.exception.InsufficientStockException
           - com.ims.order.exception.ProductNotFoundException
-          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
-          - com.ims.order.exception.InventoryServiceUnavailableException
 
 management:
   endpoints:

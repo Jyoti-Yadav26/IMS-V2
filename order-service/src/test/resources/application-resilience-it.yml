@@ -1,0 +1,32 @@
+spring:
+  cloud:
+    discovery:
+      client:
+        simple:
+          instances:
+            inventory-service:
+              - uri: http://localhost:${wiremock.server.port}
+
+resilience4j:
+  circuitbreaker:
+    circuit-breaker-aspect-order: 1
+    instances:
+      inventoryService:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 15s
+        permitted-number-of-calls-in-half-open-state: 3
+        ignore-exceptions:
+          - com.ims.order.exception.InsufficientStockException
+          - com.ims.order.exception.ProductNotFoundException
+  retry:
+    retry-aspect-order: 2
+    instances:
+      inventoryService:
+        max-attempts: 3
+        wait-duration: 50ms
+        ignore-exceptions:
+          - com.ims.order.exception.InsufficientStockException
+          - com.ims.order.exception.ProductNotFoundException

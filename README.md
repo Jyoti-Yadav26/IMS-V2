@@ -194,13 +194,41 @@ mvn test
   winner's result with a short bounded retry. Verified: 30/30 clean `200`s
   across 3 runs.
 - *Circuit breaker looked open but wasn't fast*: breaker correctly tripped
-  `OPEN`, but calls still took ~940ms. Root cause was the fallback re-throwing
-  a new exception type that retry didn't recognize as already-handled, so it
-  retried anyway. An initial theory — a second competing circuit breaker from
-  Spring Cloud OpenFeign — was tested and ruled out (latency was identical
-  either way). Fix: add the fallback's exception type to retry's
-  `ignore-exceptions`. Verified: latency dropped to ~40–80ms, no overlap with
-  pre-fix measurements.
+  `OPEN`, but calls still took ~940ms. The real cause was aspect order.
+  Resilience4j's default stacks `@Retry` outside `@CircuitBreaker`, so the
+  *inner* breaker's fallback fired on the very first failed attempt and
+  converted the real exception into `InventoryServiceUnavailableException`
+  before retry could make a second attempt. A first pass treated the symptom by
+  adding that exception type (plus `CallNotPermittedException`) to retry's
+  `ignore-exceptions`: latency dropped to ~40–80ms, but retries were now
+  silently dead — the outer retry only ever saw the fallback's already-ignored
+  exception, so a transient 500 got exactly 1 attempt instead of 3. An initial
+  theory — a second competing circuit breaker from Spring Cloud OpenFeign — was
+  tested and ruled out (latency was identical either way); that wrapper is now
+  off by default anyway, since it was redundant next to the explicit
+  annotations. Real fix: invert the aspect order
+  (`circuit-breaker-aspect-order: 1`, `retry-aspect-order: 2`) so the breaker
+  wraps the retry. Retry now gets all 3 attempts against the real downstream,
+  the breaker sees one outcome per logical call, and when it is open it rejects
+  before the retry layer is entered at all — so retry's `ignore-exceptions`
+  needs only the two business exceptions.
+- *Insufficient stock was reported as FAILED, not REJECTED*: found while writing
+  the integration test for the above. Listing an exception under
+  `ignore-exceptions` keeps it out of the breaker's statistics but does **not**
+  stop Resilience4j from invoking the fallback for it, so a 409 from
+  inventory-service was being wrapped into
+  `InventoryServiceUnavailableException` — turning a business rejection into an
+  infrastructure failure. Fix: the fallback rethrows
+  `InsufficientStockException`/`ProductNotFoundException` unchanged. Covered by
+  `InventoryResilienceIntegrationTest`, which pins all of this down against
+  WireMock: 409 → `REJECTED` after exactly 1 call, 500 → `FAILED` after exactly
+  3, and an open breaker → `FAILED` in under 100ms with 0 calls downstream.
+- *Compensating restock was retried*: the same "inventoryService" instance
+  backed both `reserveStock` and `restock`, so inverting the aspect order would
+  have given the compensation call a working 3-attempt retry too. Releasing
+  stock is not idempotent — a retry after a lost response would release it twice
+  — so `@Retry` was dropped from `restock`, keeping only the breaker and its
+  best-effort logging fallback.
 
   
 **Deliberate trade-offs**

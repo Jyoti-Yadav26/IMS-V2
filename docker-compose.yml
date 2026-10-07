@@ -167,7 +167,7 @@ services:
       DB_PASSWORD: ims
       KAFKA_BROKER: kafka:29092
       EUREKA_URI: http://eureka-server:8761/eureka/
-      SPRING_CLOUD_OPENFEIGN_CIRCUITBREAKER_ENABLED: ${FEIGN_CB_ENABLED:-true}
+      SPRING_CLOUD_OPENFEIGN_CIRCUITBREAKER_ENABLED: ${FEIGN_CB_ENABLED:-false}
 
   notification-service:
     build:
