@@ -28,6 +28,10 @@ public class KafkaProducerConfig {
         props.put(ProducerConfig.ACKS_CONFIG, "all");
         props.put(ProducerConfig.RETRIES_CONFIG, 3);
         props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+        // Stamp a stable logical type token into the "__TypeId__" header instead of this
+        // service's own class name, so consumers map the token to their own copy of the
+        // contract and aren't coupled to order-service's package layout.
+        props.put(JsonSerializer.TYPE_MAPPINGS, "order-event:com.ims.order.event.OrderEvent");
         return new DefaultKafkaProducerFactory<>(props);
     }
 

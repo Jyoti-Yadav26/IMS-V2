@@ -229,6 +229,27 @@ mvn test
   stock is not idempotent — a retry after a lost response would release it twice
   — so `@Retry` was dropped from `restock`, keeping only the breaker and its
   best-effort logging fallback.
+- *Every Kafka event was quietly dead-lettered*: `JsonSerializer` stamps the
+  **producer's** fully-qualified class name into the `__TypeId__` header, but
+  notification-service keeps its own copy of each contract (see the
+  duplicated-DTO trade-off below) and trusts only `com.ims.notification.event`.
+  Every order and low-stock event therefore failed type resolution with `The
+  class 'com.ims.order.event.OrderEvent' is not in the trusted packages`, and
+  because `DefaultErrorHandler` treats a `DeserializationException` as
+  non-retryable, each one went to `<topic>.DLT` on the first attempt. Not a
+  single notification was ever persisted. The dead-letter machinery worked
+  exactly as designed, which is precisely why nobody noticed: nothing wedged,
+  nothing threw, the events just drained into a topic no one was reading. Missed
+  in tests because the only consumer coverage called the listener method
+  directly, never crossing a serializer. Fix: both producers publish a logical
+  token (`order-event`, `low-stock-event`) via `spring.json.type.mapping`, and
+  the consumer maps those tokens to its own records — a mapped token is resolved
+  before the trusted-packages check, so the topic contract is now a name both
+  sides agree on rather than one service's package layout. Pinned by
+  `OrderEventKafkaTypeMappingIntegrationTest`, which publishes through a producer
+  configured identically to order-service's and asserts the `Notification` row,
+  plus a second case that replays the old raw-class-name header and asserts it
+  lands on `order-events.DLT` carrying that exact exception.
 
   
 **Deliberate trade-offs**

@@ -43,6 +43,13 @@ public class KafkaConsumerConfig {
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ErrorHandlingDeserializer.class);
         props.put(ErrorHandlingDeserializer.KEY_DESERIALIZER_CLASS, StringDeserializer.class);
         props.put(ErrorHandlingDeserializer.VALUE_DESERIALIZER_CLASS, JsonDeserializer.class);
+        // Producers publish a logical type token rather than their own class name; map each
+        // one to this service's copy of the contract. A mapped token is resolved before the
+        // trusted-packages check, which is what keeps the duplicated-DTO approach workable.
+        props.put(JsonDeserializer.TYPE_MAPPINGS,
+                "order-event:com.ims.notification.event.OrderEvent,"
+                        + "low-stock-event:com.ims.notification.event.LowStockEvent");
+        // Backstop for anything arriving without a recognised token.
         props.put(JsonDeserializer.TRUSTED_PACKAGES, "com.ims.notification.event");
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
         return new DefaultKafkaConsumerFactory<>(props);
