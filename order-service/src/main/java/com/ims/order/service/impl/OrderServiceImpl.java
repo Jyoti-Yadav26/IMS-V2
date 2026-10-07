@@ -9,6 +9,7 @@ import com.ims.order.entity.Order;
 import com.ims.order.entity.OrderItem;
 import com.ims.order.entity.OrderStatus;
 import com.ims.order.event.OrderEventPublisher;
+import com.ims.order.exception.DuplicateSkuException;
 import com.ims.order.exception.InsufficientStockException;
 import com.ims.order.exception.InventoryServiceUnavailableException;
 import com.ims.order.exception.OrderNotFoundException;
@@ -21,7 +22,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 @Service
 @RequiredArgsConstructor
@@ -45,19 +48,26 @@ public class OrderServiceImpl implements OrderService {
      * The order row itself is persisted up front in PENDING before any remote calls, so
      * there's always a durable audit trail of the attempt even if this process crashes
      * mid-reservation.
+     * <p>
+     * A request that repeats a SKU across line items is rejected up front (400) rather than
+     * reserved, because the two lines would share one reservation idempotency key.
      */
     @Override
     @Transactional
     public OrderResponse createOrder(OrderRequest request) {
+        validateNoDuplicateSkus(request);
+
         Order order = buildPendingOrder(request);
         order = orderRepository.save(order);
 
         OrderStatus resultStatus = OrderStatus.CONFIRMED;
         String failureReason = null;
 
-        for (OrderItem item : order.getItems()) {
+        List<OrderItem> items = order.getItems();
+        for (int i = 0; i < items.size(); i++) {
+            OrderItem item = items.get(i);
             try {
-                reserveItem(order, item);
+                reserveItem(order, item, i);
             } catch (InsufficientStockException | ProductNotFoundException ex) {
                 resultStatus = OrderStatus.REJECTED;
                 failureReason = ex.getMessage();
@@ -92,8 +102,11 @@ public class OrderServiceImpl implements OrderService {
         return orderRepository.findAll().stream().map(OrderResponse::from).toList();
     }
 
-    private void reserveItem(Order order, OrderItem item) {
-        String idempotencyKey = order.getOrderNumber() + "-" + item.getSku();
+    private void reserveItem(Order order, OrderItem item, int itemIndex) {
+        // Keyed by line-item position, not SKU: a per-SKU key collides when one order repeats a
+        // SKU, and inventory-service would then replay the first reservation instead of
+        // decrementing again (oversell). The position is stable for the life of this call.
+        String idempotencyKey = order.getOrderNumber() + "-" + itemIndex;
         inventoryClientAdapter.reserveStock(new StockReservationRequest(item.getSku(), item.getQuantity(), idempotencyKey));
         item.setReserved(true);
     }
@@ -110,6 +123,22 @@ public class OrderServiceImpl implements OrderService {
                     // Already logged loudly inside the fallback; swallow here so one bad
                     // compensation doesn't stop us from releasing the other line items.
                 }
+            }
+        }
+    }
+
+    /**
+     * Two lines with the same SKU used to produce the same reservation idempotency key, so
+     * inventory-service replayed the first reservation instead of decrementing twice (oversell).
+     * The order is rejected outright rather than silently merged, so the caller sees exactly
+     * what it asked for. Comparison is exact: SKUs are opaque identifiers everywhere else.
+     */
+    private void validateNoDuplicateSkus(OrderRequest request) {
+        Set<String> seen = new HashSet<>();
+        for (OrderItemRequest itemRequest : request.items()) {
+            if (!seen.add(itemRequest.sku())) {
+                throw new DuplicateSkuException("sku '" + itemRequest.sku()
+                        + "' appears more than once; combine the quantities into a single line item");
             }
         }
     }

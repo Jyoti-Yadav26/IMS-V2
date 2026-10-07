@@ -26,6 +26,15 @@ public class GlobalExceptionHandler {
         return build(HttpStatus.BAD_REQUEST, messages, req);
     }
 
+    /**
+     * Without this mapping the duplicate-SKU rejection would fall into {@link #handleGeneric}
+     * and surface as a 500, even though it is purely a bad request.
+     */
+    @ExceptionHandler(DuplicateSkuException.class)
+    public ResponseEntity<ErrorResponse> handleDuplicateSku(DuplicateSkuException ex, HttpServletRequest req) {
+        return build(HttpStatus.BAD_REQUEST, List.of(ex.getMessage()), req);
+    }
+
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleGeneric(Exception ex, HttpServletRequest req) {
         return build(HttpStatus.INTERNAL_SERVER_ERROR, List.of("Unexpected error: " + ex.getMessage()), req);
