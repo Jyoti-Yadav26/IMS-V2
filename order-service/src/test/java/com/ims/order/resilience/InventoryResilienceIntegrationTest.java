@@ -1,6 +1,7 @@
 package com.ims.order.resilience;
 
 import com.ims.order.dto.OrderItemRequest;
+import com.ims.order.dto.OrderItemResponse;
 import com.ims.order.dto.OrderRequest;
 import com.ims.order.dto.OrderResponse;
 import com.ims.order.entity.OrderStatus;
@@ -22,6 +23,7 @@ import java.util.List;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 
 /**
  * Exercises the real Resilience4j @CircuitBreaker/@Retry stack on InventoryClientAdapter
@@ -119,6 +121,10 @@ class InventoryResilienceIntegrationTest {
 
         assertThat(response.getBody().status()).isEqualTo(OrderStatus.REJECTED);
         verify(1, postRequestedFor(urlPathMatching("/api/inventory/products/.*/restock")));
+        // The restock 500 reaches restockFallback, which throws instead of returning: SKU-4 is
+        // still decremented in inventory, so the order has to keep showing it as reserved.
+        assertThat(response.getBody().items()).extracting(OrderItemResponse::sku, OrderItemResponse::reserved)
+                .containsExactly(tuple("SKU-4", true), tuple("SKU-5", false));
     }
 
     private ResponseEntity<OrderResponse> postOrder(String sku) {

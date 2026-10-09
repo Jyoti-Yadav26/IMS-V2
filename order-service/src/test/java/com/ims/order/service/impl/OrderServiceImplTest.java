@@ -4,6 +4,7 @@ import com.ims.order.client.InventoryClientAdapter;
 import com.ims.order.client.dto.StockReservationRequest;
 import com.ims.order.client.dto.StockReservationResponse;
 import com.ims.order.dto.OrderItemRequest;
+import com.ims.order.dto.OrderItemResponse;
 import com.ims.order.dto.OrderRequest;
 import com.ims.order.dto.OrderResponse;
 import com.ims.order.entity.Order;
@@ -26,6 +27,7 @@ import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
@@ -108,6 +110,28 @@ class OrderServiceImplTest {
 
         assertThat(response.status()).isEqualTo(OrderStatus.FAILED);
         verify(inventoryClientAdapter).restock("SKU-1", 2);
+    }
+
+    @Test
+    void createOrder_leavesItemReservedWhenCompensatingRestockFails() {
+        // SKU-1 reserves, SKU-2 is rejected, so compensation tries to release SKU-1 - and that
+        // release fails too (inventory-service down). The stock is therefore still decremented
+        // downstream, so the order must not claim the line was released.
+        when(inventoryClientAdapter.reserveStock(argThat(r -> r != null && r.sku().equals("SKU-1"))))
+                .thenReturn(new StockReservationResponse(true, "SKU-1", 5, "ok"));
+        when(inventoryClientAdapter.reserveStock(argThat((StockReservationRequest r) -> r != null && r.sku().equals("SKU-2"))))
+                .thenThrow(new InsufficientStockException("not enough SKU-2"));
+        doThrow(new InventoryServiceUnavailableException("inventory-service is down", new RuntimeException()))
+                .when(inventoryClientAdapter).restock("SKU-1", 2);
+
+        OrderResponse response = orderService.createOrder(twoItemRequest);
+
+        assertThat(response.status()).isEqualTo(OrderStatus.REJECTED);
+        assertThat(response.failureReason()).contains("SKU-2");
+        verify(inventoryClientAdapter).restock("SKU-1", 2);
+        // SKU-1 stays reserved because the release failed; SKU-2 was never reserved at all.
+        assertThat(response.items()).extracting(OrderItemResponse::sku, OrderItemResponse::reserved)
+                .containsExactly(tuple("SKU-1", true), tuple("SKU-2", false));
     }
 
     @Test

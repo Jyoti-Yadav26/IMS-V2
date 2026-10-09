@@ -65,10 +65,14 @@ public class InventoryClientAdapter {
 
     @SuppressWarnings("unused") // invoked reflectively by Resilience4j
     private void restockFallback(String sku, int quantity, Throwable t) {
-        // Compensation is best-effort: if inventory-service is down, the compensating
-        // restock will simply fail too. We log loudly so an operator/reconciliation job
-        // can fix the drift instead of silently losing stock.
-        log.error("COMPENSATION FAILED: could not restock sku={} quantity={} after order failure: {}",
-                sku, quantity, t.toString());
+        // A fallback that just returns is indistinguishable from success to the caller, which
+        // would then mark the line item released even though the stock is still decremented
+        // downstream. So this one throws: the compensation loop in OrderServiceImpl catches it,
+        // leaves reserved=true and logs the drift with the order number.
+        if (t instanceof ProductNotFoundException) {
+            throw (RuntimeException) t;
+        }
+        throw new InventoryServiceUnavailableException(
+                "could not restock sku=" + sku + " quantity=" + quantity, t);
     }
 }

@@ -120,8 +120,12 @@ public class OrderServiceImpl implements OrderService {
                     log.info("Compensated (released) sku={} quantity={} for failed order={}",
                             item.getSku(), item.getQuantity(), order.getOrderNumber());
                 } catch (Exception ex) {
-                    // Already logged loudly inside the fallback; swallow here so one bad
-                    // compensation doesn't stop us from releasing the other line items.
+                    // The release failed, so inventory is still decremented for this line.
+                    // reserved stays true (the save after compensation persists it) so the order
+                    // row records exactly what was not released, and the loop carries on so one
+                    // bad compensation doesn't block the other line items.
+                    log.error("COMPENSATION FAILED: order={} sku={} quantity={} is still reserved in inventory: {}",
+                            order.getOrderNumber(), item.getSku(), item.getQuantity(), ex.toString());
                 }
             }
         }
