@@ -10,7 +10,9 @@ import lombok.Setter;
 import java.math.BigDecimal;
 
 @Entity
-@Table(name = "order_items")
+// Every read of an order loads its items by order_id (and the FK alone does not create an index
+// in Postgres), so without this the item lookup is a sequential scan of the whole table.
+@Table(name = "order_items", indexes = @Index(name = "idx_order_items_order_id", columnList = "order_id"))
 @Getter
 @Setter
 @Builder
