@@ -24,6 +24,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -171,5 +172,55 @@ class OrderServiceImplTest {
         verify(orderRepository, never()).save(any(Order.class));
         verify(inventoryClientAdapter, never()).reserveStock(any());
         verify(inventoryClientAdapter, never()).restock(any(), anyInt());
+    }
+
+    @Test
+    void createOrder_replaysStoredOrderWhenIdempotencyKeyAlreadyUsed() {
+        // The same key was already used by an earlier request, so this one must hand back that order
+        // untouched - a double click or a client retry cannot place a second order or reserve again.
+        Order stored = Order.builder()
+                .orderNumber("ORD-STORED")
+                .customerEmail("buyer@example.com")
+                .status(OrderStatus.CONFIRMED)
+                .totalAmount(BigDecimal.valueOf(40))
+                .idempotencyKey("KEY-1")
+                .build();
+        when(orderRepository.findByIdempotencyKey("KEY-1")).thenReturn(Optional.of(stored));
+
+        OrderResponse response = orderService.createOrder(twoItemRequest, "KEY-1");
+
+        assertThat(response.orderNumber()).isEqualTo("ORD-STORED");
+        assertThat(response.status()).isEqualTo(OrderStatus.CONFIRMED);
+        verify(orderRepository, never()).save(any(Order.class));
+        verify(inventoryClientAdapter, never()).reserveStock(any());
+        verify(eventPublisher, never()).publish(any(Order.class));
+    }
+
+    @Test
+    void createOrder_storesIdempotencyKeyOnTheNewOrder() {
+        when(inventoryClientAdapter.reserveStock(any())).thenReturn(new StockReservationResponse(true, "SKU", 5, "ok"));
+
+        orderService.createOrder(twoItemRequest, "KEY-1");
+
+        // Persisted on the order row itself, under a unique constraint - that row is what makes the
+        // key durable across instances and restarts, rather than anything held in memory.
+        ArgumentCaptor<Order> captor = ArgumentCaptor.forClass(Order.class);
+        verify(orderRepository, atLeastOnce()).save(captor.capture());
+        assertThat(captor.getValue().getIdempotencyKey()).isEqualTo("KEY-1");
+    }
+
+    @Test
+    void createOrder_treatsBlankIdempotencyKeyAsAbsent() {
+        when(inventoryClientAdapter.reserveStock(any())).thenReturn(new StockReservationResponse(true, "SKU", 5, "ok"));
+
+        OrderResponse response = orderService.createOrder(twoItemRequest, "   ");
+
+        assertThat(response.status()).isEqualTo(OrderStatus.CONFIRMED);
+        // A blank header is no key at all: it is never looked up, and it is stored as null so two
+        // blank-keyed orders can never collide on the unique constraint.
+        verify(orderRepository, never()).findByIdempotencyKey(any());
+        ArgumentCaptor<Order> captor = ArgumentCaptor.forClass(Order.class);
+        verify(orderRepository, atLeastOnce()).save(captor.capture());
+        assertThat(captor.getValue().getIdempotencyKey()).isNull();
     }
 }

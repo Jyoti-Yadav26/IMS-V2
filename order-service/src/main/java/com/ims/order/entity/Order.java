@@ -14,7 +14,8 @@ import java.util.List;
 import java.util.UUID;
 
 @Entity
-@Table(name = "orders")
+@Table(name = "orders",
+        uniqueConstraints = @UniqueConstraint(name = "uk_orders_idempotency_key", columnNames = "idempotency_key"))
 @Getter
 @Setter
 @Builder
@@ -38,6 +39,14 @@ public class Order {
 
     @Column(name = "failure_reason")
     private String failureReason;
+
+    /**
+     * Client-supplied {@code Idempotency-Key} for the request that placed this order, or null when the
+     * caller did not send one. Nullable on purpose: the unique constraint treats NULLs as distinct in
+     * both Postgres and H2, so any number of key-less orders coexist while a key can be used once.
+     */
+    @Column(name = "idempotency_key")
+    private String idempotencyKey;
 
     @Column(name = "total_amount", nullable = false)
     private BigDecimal totalAmount;

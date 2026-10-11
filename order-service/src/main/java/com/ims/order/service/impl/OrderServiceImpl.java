@@ -20,10 +20,12 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.StringUtils;
 
 import java.math.BigDecimal;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 @Service
@@ -51,13 +53,30 @@ public class OrderServiceImpl implements OrderService {
      * <p>
      * A request that repeats a SKU across line items is rejected up front (400) rather than
      * reserved, because the two lines would share one reservation idempotency key.
+     * <p>
+     * When the caller supplied an {@code Idempotency-Key} and an order already carries it, that stored
+     * order is returned and nothing is reserved again - a double-clicked or retried request must not
+     * place a second order. The key is held under a unique constraint on {@code orders}, so this
+     * pre-check is only the fast path; the race where two requests get past it at the same time is
+     * resolved by {@link IdempotentOrderCreator}. The key is compared exactly and the request body is
+     * deliberately not fingerprinted, so re-using a key with a different body replays the first order.
      */
     @Override
     @Transactional
-    public OrderResponse createOrder(OrderRequest request) {
+    public OrderResponse createOrder(OrderRequest request, String idempotencyKey) {
+        String key = StringUtils.hasText(idempotencyKey) ? idempotencyKey : null;
+        if (key != null) {
+            Optional<Order> replay = orderRepository.findByIdempotencyKey(key);
+            if (replay.isPresent()) {
+                log.info("Replaying order {} for Idempotency-Key {}", replay.get().getOrderNumber(), key);
+                return OrderResponse.from(replay.get());
+            }
+        }
+
         validateNoDuplicateSkus(request);
 
         Order order = buildPendingOrder(request);
+        order.setIdempotencyKey(key);
         order = orderRepository.save(order);
 
         OrderStatus resultStatus = OrderStatus.CONFIRMED;

@@ -1,8 +1,11 @@
 package com.ims.order.controller;
 
 import com.ims.order.dto.OrderItemRequest;
+import com.ims.order.dto.OrderResponse;
+import com.ims.order.entity.OrderStatus;
 import com.ims.order.exception.GlobalExceptionHandler;
 import com.ims.order.service.OrderService;
+import com.ims.order.service.impl.IdempotentOrderCreator;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.ConstraintViolationException;
 import jakarta.validation.Validation;
@@ -14,9 +17,13 @@ import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.List;
 import java.util.Set;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -39,6 +46,9 @@ class OrderControllerErrorHandlingTest {
     @MockBean
     private OrderService orderService;
 
+    @MockBean
+    private IdempotentOrderCreator orderCreator;
+
     @Test
     void malformedJsonBody_returns400AndNeverReachesTheService() throws Exception {
         mockMvc.perform(post("/api/orders")
@@ -48,7 +58,7 @@ class OrderControllerErrorHandlingTest {
                 .andExpect(jsonPath("$.status").value(400))
                 .andExpect(jsonPath("$.messages[0]").value("Malformed JSON request body"));
 
-        verify(orderService, never()).createOrder(any());
+        verify(orderCreator, never()).create(any(), any());
     }
 
     @Test
@@ -71,12 +81,12 @@ class OrderControllerErrorHandlingTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.messages[0]").value("items[0].quantity: quantity must be >= 1"));
 
-        verify(orderService, never()).createOrder(any());
+        verify(orderCreator, never()).create(any(), any());
     }
 
     @Test
     void constraintViolationFromTheServiceLayer_returns400WithThePropertyPath() throws Exception {
-        when(orderService.createOrder(any())).thenThrow(new ConstraintViolationException(realViolations()));
+        when(orderCreator.create(any(), any())).thenThrow(new ConstraintViolationException(realViolations()));
 
         mockMvc.perform(post("/api/orders")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -88,7 +98,7 @@ class OrderControllerErrorHandlingTest {
 
     @Test
     void unexpectedFailure_returns500WithAGenericMessageAndNoInternalDetail() throws Exception {
-        when(orderService.createOrder(any()))
+        when(orderCreator.create(any(), any()))
                 .thenThrow(new IllegalStateException("jdbc:postgresql://db-prod-1:5432/order_db connection refused"));
 
         mockMvc.perform(post("/api/orders")
@@ -109,5 +119,36 @@ class OrderControllerErrorHandlingTest {
         try (var factory = Validation.buildDefaultValidatorFactory()) {
             return factory.getValidator().validate(new OrderItemRequest("SKU-1", 0, BigDecimal.TEN));
         }
+    }
+
+    @Test
+    void idempotencyKeyHeader_isForwardedToTheServiceLayer() throws Exception {
+        when(orderCreator.create(any(), any())).thenReturn(stubOrder());
+
+        mockMvc.perform(post("/api/orders")
+                        .header("Idempotency-Key", "key-123")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(validBody()))
+                .andExpect(status().isCreated());
+
+        verify(orderCreator).create(any(), eq("key-123"));
+    }
+
+    @Test
+    void absentIdempotencyKeyHeader_arrivesAsNullAndIsStillAccepted() throws Exception {
+        when(orderCreator.create(any(), any())).thenReturn(stubOrder());
+
+        mockMvc.perform(post("/api/orders")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(validBody()))
+                .andExpect(status().isCreated());
+
+        // The header is optional: without it the endpoint behaves exactly as it did before.
+        verify(orderCreator).create(any(), isNull());
+    }
+
+    private static OrderResponse stubOrder() {
+        return new OrderResponse("ORD-1", "buyer@example.com", OrderStatus.CONFIRMED, null,
+                BigDecimal.TEN, List.of(), Instant.now());
     }
 }
