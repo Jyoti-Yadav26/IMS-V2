@@ -14,6 +14,16 @@ spring:
       circuitbreaker:
         enabled: false
 
+# Off for the whole test module. The relay claims rows with a native Postgres query
+# (FOR UPDATE SKIP LOCKED) that H2 cannot parse, so a background thread firing it once a second
+# would break every @SpringBootTest here. OutboxRelayTest covers the relay's logic with a mocked
+# repository, OutboxRelayTransactionIntegrationTest switches the bean back on to check it really
+# runs in a transaction, and OutboxRelayPostgresKafkaIntegrationTest is the only test that runs the
+# real SQL - against real Postgres.
+outbox:
+  relay:
+    enabled: false
+
 eureka:
   client:
     enabled: false

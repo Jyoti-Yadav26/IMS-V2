@@ -26,7 +26,7 @@ class OrderEventListenerTest {
 
     @Test
     void onOrderEvent_confirmedMapsToConfirmedNotification() {
-        OrderEvent event = new OrderEvent("ORD-1", "buyer@example.com", "CONFIRMED", null, Instant.now());
+        OrderEvent event = new OrderEvent("evt-1", "ORD-1", "buyer@example.com", "CONFIRMED", null, Instant.now());
 
         listener.onOrderEvent(event);
 
@@ -35,7 +35,7 @@ class OrderEventListenerTest {
 
     @Test
     void onOrderEvent_rejectedMapsToRejectedNotification() {
-        OrderEvent event = new OrderEvent("ORD-2", "buyer@example.com", "REJECTED", "insufficient stock", Instant.now());
+        OrderEvent event = new OrderEvent("evt-2", "ORD-2", "buyer@example.com", "REJECTED", "insufficient stock", Instant.now());
 
         listener.onOrderEvent(event);
 
@@ -44,7 +44,7 @@ class OrderEventListenerTest {
 
     @Test
     void onOrderEvent_failedMapsToFailedNotification() {
-        OrderEvent event = new OrderEvent("ORD-3", "buyer@example.com", "FAILED", "inventory-service down", Instant.now());
+        OrderEvent event = new OrderEvent("evt-3", "ORD-3", "buyer@example.com", "FAILED", "inventory-service down", Instant.now());
 
         listener.onOrderEvent(event);
 

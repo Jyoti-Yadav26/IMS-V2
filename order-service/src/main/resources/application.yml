@@ -27,6 +27,14 @@ spring:
       circuitbreaker:
         enabled: false
 
+# The outbox relay: the only thing in this service that talks to Kafka. It drains outbox_events
+# after the order transaction has committed, so a broker outage can delay a notification but can
+# never affect whether an order is placed.
+outbox:
+  relay:
+    enabled: ${OUTBOX_RELAY_ENABLED:true}
+    fixed-delay-ms: 1000
+
 eureka:
   client:
     service-url:

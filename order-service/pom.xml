@@ -78,6 +78,27 @@
             <artifactId>spring-cloud-contract-wiremock</artifactId>
             <scope>test</scope>
         </dependency>
+        <!--
+          Real Postgres + Kafka for OutboxRelayPostgresKafkaIntegrationTest. The outbox relay claims
+          rows with "FOR UPDATE SKIP LOCKED", which H2 cannot parse, so that test is the only thing
+          that ever executes the real claim query. Versions come from spring-boot-dependencies'
+          testcontainers BOM - do not pin them here.
+        -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

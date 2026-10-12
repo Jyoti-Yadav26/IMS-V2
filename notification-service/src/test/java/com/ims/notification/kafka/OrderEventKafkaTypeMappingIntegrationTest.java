@@ -33,6 +33,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
@@ -136,7 +137,7 @@ class OrderEventKafkaTypeMappingIntegrationTest {
     private void publish(KafkaTemplate<String, Object> template, String orderNumber,
                          String status, String reason) {
         var event = new com.ims.order.event.OrderEvent(
-                orderNumber, "buyer@example.com", status, reason, Instant.now());
+                UUID.randomUUID().toString(), orderNumber, "buyer@example.com", status, reason, Instant.now());
         template.send(ORDER_EVENTS, orderNumber, event);
         template.flush();
     }
