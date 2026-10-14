@@ -30,7 +30,9 @@ class OrderEventListenerTest {
 
         listener.onOrderEvent(event);
 
-        verify(notificationService).send(eq(NotificationType.ORDER_CONFIRMED), eq("buyer@example.com"), any(), any(), eq("ORD-1"));
+        // The eventId is asserted rather than wildcarded: it is the de-duplication key, so a listener
+        // that dropped it would leave the consumer non-idempotent while every other assertion passed.
+        verify(notificationService).send(eq("evt-1"), eq(NotificationType.ORDER_CONFIRMED), eq("buyer@example.com"), any(), any(), eq("ORD-1"));
     }
 
     @Test
@@ -39,7 +41,7 @@ class OrderEventListenerTest {
 
         listener.onOrderEvent(event);
 
-        verify(notificationService).send(eq(NotificationType.ORDER_REJECTED), eq("buyer@example.com"), any(), any(), eq("ORD-2"));
+        verify(notificationService).send(eq("evt-2"), eq(NotificationType.ORDER_REJECTED), eq("buyer@example.com"), any(), any(), eq("ORD-2"));
     }
 
     @Test
@@ -48,6 +50,6 @@ class OrderEventListenerTest {
 
         listener.onOrderEvent(event);
 
-        verify(notificationService).send(eq(NotificationType.ORDER_FAILED), eq("buyer@example.com"), any(), any(), eq("ORD-3"));
+        verify(notificationService).send(eq("evt-3"), eq(NotificationType.ORDER_FAILED), eq("buyer@example.com"), any(), any(), eq("ORD-3"));
     }
 }

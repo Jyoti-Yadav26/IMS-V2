@@ -25,6 +25,6 @@ public class LowStockEventListener {
         String message = "Only " + event.remainingQuantity() + " unit(s) left, at or below the reorder threshold of "
                 + event.reorderThreshold() + ". Please reorder soon.";
 
-        notificationService.send(NotificationType.LOW_STOCK, ADMIN_RECIPIENT, subject, message, event.sku());
+        notificationService.send(event.eventId(), NotificationType.LOW_STOCK, ADMIN_RECIPIENT, subject, message, event.sku());
     }
 }

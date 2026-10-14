@@ -32,6 +32,6 @@ public class OrderEventListener {
             default -> "We're having trouble processing your order right now. We'll retry automatically: " + event.reason();
         };
 
-        notificationService.send(type, event.customerEmail(), subject, message, event.orderNumber());
+        notificationService.send(event.eventId(), type, event.customerEmail(), subject, message, event.orderNumber());
     }
 }
