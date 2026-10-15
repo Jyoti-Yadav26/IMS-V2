@@ -94,10 +94,33 @@ class ProductServiceImplTest {
     }
 
     @Test
+    void reserveStock_replayReturnsPriceStoredAtReservationTime() {
+        // The product now costs 10, but when this key was reserved it cost 8. A replay has to answer
+        // with what was actually reserved: the retry of a call must not be able to reprice it, or an
+        // order placed at 8 could be charged at 10 simply because it was retried.
+        StockReservationRequest request = new StockReservationRequest("SKU-1", 3, "key-priced");
+        StockReservation prior = StockReservation.builder()
+                .idempotencyKey("key-priced")
+                .sku("SKU-1").quantity(3).status(ReservationStatus.SUCCESS)
+                .message("Reserved 3 unit(s)")
+                .unitPrice(new BigDecimal("8.00"))
+                .build();
+        when(reservationRepository.findByIdempotencyKey("key-priced")).thenReturn(Optional.of(prior));
+        when(productRepository.findBySku("SKU-1")).thenReturn(Optional.of(product));
+
+        StockReservationResponse response = productService.reserveStock(request);
+
+        assertThat(response.unitPrice()).isEqualByComparingTo("8.00");
+        // Current stock is still reported as current - only the price is frozen.
+        assertThat(response.remainingQuantity()).isEqualTo(10);
+        verify(reservationExecutor, never()).attemptReservation(any());
+    }
+
+    @Test
     void reserveStock_delegatesToExecutorForNewRequest() {
         StockReservationRequest request = new StockReservationRequest("SKU-1", 3, "key-new");
         when(reservationRepository.findByIdempotencyKey("key-new")).thenReturn(Optional.empty());
-        StockReservationResponse expected = new StockReservationResponse(true, "SKU-1", 7, "Reserved 3 unit(s)");
+        StockReservationResponse expected = new StockReservationResponse(true, "SKU-1", 7, "Reserved 3 unit(s)", BigDecimal.TEN);
         when(reservationExecutor.attemptReservation(request)).thenReturn(expected);
 
         StockReservationResponse response = productService.reserveStock(request);
@@ -109,7 +132,7 @@ class ProductServiceImplTest {
     void reserveStock_retriesOnOptimisticLockConflictThenSucceeds() {
         StockReservationRequest request = new StockReservationRequest("SKU-1", 3, "key-retry");
         when(reservationRepository.findByIdempotencyKey("key-retry")).thenReturn(Optional.empty());
-        StockReservationResponse expected = new StockReservationResponse(true, "SKU-1", 7, "Reserved 3 unit(s)");
+        StockReservationResponse expected = new StockReservationResponse(true, "SKU-1", 7, "Reserved 3 unit(s)", BigDecimal.TEN);
         when(reservationExecutor.attemptReservation(request))
                 .thenThrow(new ObjectOptimisticLockingFailureException(Product.class, 1L))
                 .thenReturn(expected);

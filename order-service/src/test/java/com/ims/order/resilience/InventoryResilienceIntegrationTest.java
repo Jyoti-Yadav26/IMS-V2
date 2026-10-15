@@ -82,7 +82,7 @@ class InventoryResilienceIntegrationTest {
     void circuitOpen_failsFastWithZeroCalls() {
         stubFor(post(urlEqualTo(RESERVE_URL)).willReturn(aResponse().withStatus(200)
                 .withHeader("Content-Type", "application/json")
-                .withBody("{\"reserved\":true,\"sku\":\"SKU-3\",\"remainingQuantity\":5,\"message\":\"ok\"}")));
+                .withBody("{\"reserved\":true,\"sku\":\"SKU-3\",\"remainingQuantity\":5,\"message\":\"ok\",\"unitPrice\":10.00}")));
 
         // Warm-up call while the circuit is still closed, so JVM/HTTP-client/connection
         // setup costs don't bleed into the timing assertion below.
@@ -106,7 +106,7 @@ class InventoryResilienceIntegrationTest {
                 .withRequestBody(matchingJsonPath("$[?(@.sku == 'SKU-4')]"))
                 .willReturn(aResponse().withStatus(200)
                         .withHeader("Content-Type", "application/json")
-                        .withBody("{\"reserved\":true,\"sku\":\"SKU-4\",\"remainingQuantity\":5,\"message\":\"ok\"}")));
+                        .withBody("{\"reserved\":true,\"sku\":\"SKU-4\",\"remainingQuantity\":5,\"message\":\"ok\",\"unitPrice\":10.00}")));
         stubFor(post(urlEqualTo(RESERVE_URL))
                 .withRequestBody(matchingJsonPath("$[?(@.sku == 'SKU-5')]"))
                 .willReturn(aResponse().withStatus(409).withBody("Insufficient stock for sku 'SKU-5'")));

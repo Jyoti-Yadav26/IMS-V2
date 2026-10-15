@@ -7,6 +7,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 
 /**
@@ -42,6 +43,14 @@ public class StockReservation {
     private ReservationStatus status;
 
     private String message;
+
+    /**
+     * The product's price at the moment of the reservation, so an idempotent replay answers with the
+     * price that was actually reserved rather than whatever the price happens to be now. Nullable:
+     * rows written before this column existed have none, and a FAILED attempt priced nothing.
+     */
+    @Column(name = "unit_price")
+    private BigDecimal unitPrice;
 
     @Column(name = "created_at")
     private Instant createdAt;

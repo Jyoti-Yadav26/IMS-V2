@@ -34,7 +34,12 @@ public class OrderItem {
     @Column(nullable = false)
     private Integer quantity;
 
-    @Column(name = "unit_price", nullable = false)
+    /**
+     * The price inventory-service charged for this line, set from its reservation response - never
+     * from the request. Nullable: a line that was never successfully reserved was never priced, and
+     * null is deliberately distinguishable from a product that genuinely costs 0.00.
+     */
+    @Column(name = "unit_price")
     private BigDecimal unitPrice;
 
     /** Whether inventory-service actually decremented stock for this line item; drives compensation on partial failure. */

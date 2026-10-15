@@ -108,6 +108,22 @@ class OrderControllerErrorHandlingTest {
                 .andExpect(jsonPath("$.messages[0]").value("An unexpected internal error occurred"));
     }
 
+    @Test
+    void bodyWithoutUnitPrice_isAcceptedBecauseThePriceComesFromInventory() throws Exception {
+        when(orderCreator.create(any(), any())).thenReturn(stubOrder());
+
+        // unitPrice used to be @NotNull. It is now optional and ignored, so a caller that omits it
+        // must get an order rather than a 400 - the price is inventory's to supply, not the client's.
+        mockMvc.perform(post("/api/orders")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"customerEmail":"buyer@example.com",
+                                 "items":[{"sku":"SKU-1","quantity":1}]}"""))
+                .andExpect(status().isCreated());
+
+        verify(orderCreator).create(any(), isNull());
+    }
+
     private static String validBody() {
         return """
                 {"customerEmail":"buyer@example.com",

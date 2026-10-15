@@ -2,6 +2,7 @@ package com.ims.order.service.impl;
 
 import com.ims.order.client.InventoryClientAdapter;
 import com.ims.order.client.dto.StockReservationRequest;
+import com.ims.order.client.dto.StockReservationResponse;
 import com.ims.order.dto.OrderItemRequest;
 import com.ims.order.dto.OrderRequest;
 import com.ims.order.dto.OrderResponse;
@@ -11,6 +12,7 @@ import com.ims.order.entity.OrderStatus;
 import com.ims.order.event.OrderEventPublisher;
 import com.ims.order.exception.DuplicateSkuException;
 import com.ims.order.exception.InsufficientStockException;
+import com.ims.order.exception.InvalidInventoryResponseException;
 import com.ims.order.exception.InventoryServiceUnavailableException;
 import com.ims.order.exception.OrderNotFoundException;
 import com.ims.order.exception.ProductNotFoundException;
@@ -54,6 +56,12 @@ public class OrderServiceImpl implements OrderService {
      * A request that repeats a SKU across line items is rejected up front (400) rather than
      * reserved, because the two lines would share one reservation idempotency key.
      * <p>
+     * Prices are not the caller's to decide. Each line is priced by inventory-service as part of
+     * reserving it, and {@code totalAmount} is summed from those prices just before the final save -
+     * any {@code unitPrice} in the request is ignored outright. Only a CONFIRMED order carries a
+     * total; a REJECTED or FAILED one is zero, because its reserved stock was released and nothing
+     * is owed.
+     * <p>
      * When the caller supplied an {@code Idempotency-Key} and an order already carries it, that stored
      * order is returned and nothing is reserved again - a double-clicked or retried request must not
      * place a second order. The key is held under a unique constraint on {@code orders}, so this
@@ -91,7 +99,7 @@ public class OrderServiceImpl implements OrderService {
                 resultStatus = OrderStatus.REJECTED;
                 failureReason = ex.getMessage();
                 break;
-            } catch (InventoryServiceUnavailableException ex) {
+            } catch (InventoryServiceUnavailableException | InvalidInventoryResponseException ex) {
                 resultStatus = OrderStatus.FAILED;
                 failureReason = ex.getMessage();
                 break;
@@ -104,6 +112,9 @@ public class OrderServiceImpl implements OrderService {
 
         order.setStatus(resultStatus);
         order.setFailureReason(failureReason);
+        // Recomputed here, from inventory's prices, before the save and therefore before the outbox
+        // row is written - so the persisted total and the published event agree on a trusted number.
+        order.setTotalAmount(resultStatus == OrderStatus.CONFIRMED ? trustedTotal(order) : BigDecimal.ZERO);
         Order saved = orderRepository.save(order);
 
         eventPublisher.publish(saved);
@@ -121,13 +132,58 @@ public class OrderServiceImpl implements OrderService {
         return orderRepository.findAll().stream().map(OrderResponse::from).toList();
     }
 
+    /**
+     * Reserves one line item and stamps it with the price inventory-service charged.
+     * <p>
+     * The price is taken from the reservation response, never from the request: inventory owns the
+     * product and therefore owns its price. {@code reserved} is recorded before the price is checked,
+     * because the two failures below are not the same thing and the difference decides whether
+     * compensation has anything to release.
+     */
     private void reserveItem(Order order, OrderItem item, int itemIndex) {
         // Keyed by line-item position, not SKU: a per-SKU key collides when one order repeats a
         // SKU, and inventory-service would then replay the first reservation instead of
         // decrementing again (oversell). The position is stable for the life of this call.
         String idempotencyKey = order.getOrderNumber() + "-" + itemIndex;
-        inventoryClientAdapter.reserveStock(new StockReservationRequest(item.getSku(), item.getQuantity(), idempotencyKey));
-        item.setReserved(true);
+        StockReservationResponse response = inventoryClientAdapter.reserveStock(
+                new StockReservationRequest(item.getSku(), item.getQuantity(), idempotencyKey));
+
+        // Whatever inventory actually did, before anything else can throw.
+        item.setReserved(response.reserved());
+
+        if (!response.reserved()) {
+            // Inventory declined - a business answer, so the order is REJECTED. Stock was not
+            // decremented, so this line must not be "compensated" or it would create phantom units.
+            // Reached when a previously-FAILED reservation is replayed: that answers 200 with
+            // reserved=false rather than the 409 a first attempt would return.
+            throw new InsufficientStockException(StringUtils.hasText(response.message())
+                    ? response.message()
+                    : "inventory-service did not reserve sku '" + item.getSku() + "'");
+        }
+        if (response.unitPrice() == null) {
+            // Stock WAS decremented but the answer is unusable, so the line stays reserved=true and
+            // compensation releases it. We cannot price the order and we will not guess.
+            log.error("Invalid response from inventory-service for order={} sku={}: reserved with no unitPrice",
+                    order.getOrderNumber(), item.getSku());
+            throw new InvalidInventoryResponseException("inventory-service reserved sku '" + item.getSku()
+                    + "' without a unitPrice");
+        }
+        item.setUnitPrice(response.unitPrice());
+    }
+
+    /**
+     * The order total, summed from the prices inventory-service returned. Only ever called for a
+     * CONFIRMED order, where every line is priced by construction - {@link #reserveItem} refuses to
+     * leave a reserved line unpriced - but unpriced lines are skipped rather than trusted to be absent.
+     */
+    private BigDecimal trustedTotal(Order order) {
+        BigDecimal total = BigDecimal.ZERO;
+        for (OrderItem item : order.getItems()) {
+            if (item.getUnitPrice() != null) {
+                total = total.add(item.getUnitPrice().multiply(BigDecimal.valueOf(item.getQuantity())));
+            }
+        }
+        return total;
     }
 
     private void compensateReservedItems(Order order) {
@@ -173,18 +229,17 @@ public class OrderServiceImpl implements OrderService {
                 .totalAmount(BigDecimal.ZERO)
                 .build();
 
-        BigDecimal total = BigDecimal.ZERO;
+        // No prices yet, and deliberately none from the request: each line is priced by
+        // inventory-service when it is reserved, and the total is summed from those prices once the
+        // saga has finished. A PENDING order is not a payable order, so a zero total is honest here.
         for (OrderItemRequest itemRequest : request.items()) {
             OrderItem item = OrderItem.builder()
                     .sku(itemRequest.sku())
                     .quantity(itemRequest.quantity())
-                    .unitPrice(itemRequest.unitPrice())
                     .reserved(false)
                     .build();
             order.addItem(item);
-            total = total.add(itemRequest.unitPrice().multiply(BigDecimal.valueOf(itemRequest.quantity())));
         }
-        order.setTotalAmount(total);
         return order;
     }
 

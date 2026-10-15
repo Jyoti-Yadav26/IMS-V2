@@ -15,6 +15,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.time.Instant;
 
 /**
@@ -40,7 +41,8 @@ class StockReservationExecutor {
         if (product.getQuantity() < request.quantity()) {
             String message = "Insufficient stock for sku '" + request.sku() + "': requested="
                     + request.quantity() + ", available=" + product.getQuantity();
-            saveReservationRecord(request, ReservationStatus.FAILED, message);
+            // No unitPrice on a failed attempt: nothing was reserved, so there is no reserved price.
+            saveReservationRecord(request, ReservationStatus.FAILED, message, null);
             throw new InsufficientStockException(message);
         }
 
@@ -48,23 +50,27 @@ class StockReservationExecutor {
         Product saved = productRepository.save(product); // version bump happens here; throws on conflict
 
         String message = "Reserved " + request.quantity() + " unit(s) of '" + request.sku() + "'";
-        saveReservationRecord(request, ReservationStatus.SUCCESS, message);
+        // The price is frozen onto the ledger row, which is what a later replay of this same
+        // idempotency key answers with.
+        saveReservationRecord(request, ReservationStatus.SUCCESS, message, saved.getPrice());
 
         if (saved.isBelowThreshold()) {
             eventPublisher.publishLowStock(saved);
         }
 
         log.info("Reserved stock sku={} quantity={} remaining={}", request.sku(), request.quantity(), saved.getQuantity());
-        return new StockReservationResponse(true, saved.getSku(), saved.getQuantity(), message);
+        return new StockReservationResponse(true, saved.getSku(), saved.getQuantity(), message, saved.getPrice());
     }
 
-    private void saveReservationRecord(StockReservationRequest request, ReservationStatus status, String message) {
+    private void saveReservationRecord(StockReservationRequest request, ReservationStatus status, String message,
+                                       BigDecimal unitPrice) {
         StockReservation record = StockReservation.builder()
                 .idempotencyKey(request.idempotencyKey())
                 .sku(request.sku())
                 .quantity(request.quantity())
                 .status(status)
                 .message(message)
+                .unitPrice(unitPrice)
                 .createdAt(Instant.now())
                 .build();
         reservationRepository.save(record);

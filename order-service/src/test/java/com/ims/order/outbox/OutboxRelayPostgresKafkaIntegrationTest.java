@@ -35,6 +35,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
+import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -53,15 +54,21 @@ import static org.mockito.Mockito.when;
  * the broker is reachable again. Under the old fire-and-forget publish that event was simply gone,
  * with a log line as its only trace.
  *
- * <p>Skipped, not failed, when Testcontainers cannot reach a Docker environment. Note that this
- * currently skips even <em>with</em> Docker Desktop running: the Testcontainers version managed by
- * Spring Boot 3.2.5's BOM (1.19.7) negotiates a Docker API version that Engine 29 no longer accepts,
- * so its probe gets an HTTP 400 and it reports Docker as unavailable. Overriding that version would
- * break the project's version freeze, so until the BOM moves, this class is verified on CI or on an
- * older engine. The same properties were checked by hand against the compose stack -
- * {@code docker compose up -d postgres-order zookeeper kafka}, {@code docker compose stop kafka},
- * place an order, watch the row stay NEW with climbing attempts, {@code docker compose start kafka},
- * watch it flip to SENT - which is the procedure to repeat if this test cannot run.
+ * <p>Skipped, not failed, when Testcontainers cannot reach a Docker environment. This used to skip
+ * even <em>with</em> Docker Desktop running, and the cause was not what it looked like: the
+ * Testcontainers version the Spring Boot 3.2.5 BOM manages (1.19.7) does not negotiate an API
+ * version at all. {@code DockerClientProviderStrategy.getClientForConfig} falls back to a
+ * hard-coded {@code RemoteApiVersion.VERSION_1_32} whenever none is configured, and Engine 29
+ * raised its <em>minimum</em> supported API version to 1.40, so {@code /v1.32/info} came back
+ * HTTP 400 and Testcontainers declared Docker unavailable. The fix is
+ * {@code src/test/resources/docker-java.properties} with {@code api.version=1.44} - test-scoped
+ * configuration, no dependency version touched, so CLAUDE.md's version freeze was never the
+ * obstacle it appeared to be. See that file for the full reasoning.
+ *
+ * <p>If this class ever cannot run, the same properties can be checked by hand against the compose
+ * stack - {@code docker compose up -d postgres-order zookeeper kafka},
+ * {@code docker compose stop kafka}, place an order, watch the row stay NEW with climbing attempts,
+ * {@code docker compose start kafka}, watch it flip to SENT.
  *
  * <p>"Kafka down, then up" is done by pointing the application at a dead address and later
  * re-pointing the producer factory at the live container, rather than by stopping the broker.
@@ -128,7 +135,7 @@ class OutboxRelayPostgresKafkaIntegrationTest {
     void anOrderPlacedWhileKafkaIsDown_isStillPlacedAndItsEventIsDeliveredOnceKafkaIsBack() {
         when(inventoryClientAdapter.reserveStock(any())).thenAnswer(invocation -> {
             StockReservationRequest request = invocation.getArgument(0);
-            return new StockReservationResponse(true, request.sku(), 5, "Reserved");
+            return new StockReservationResponse(true, request.sku(), 5, "Reserved", new BigDecimal("10.00"));
         });
 
         HttpHeaders headers = new HttpHeaders();

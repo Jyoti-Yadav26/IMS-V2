@@ -60,7 +60,7 @@ class OrderIdempotencyIntegrationTest {
         orderRepository.deleteAll();
         when(inventoryClientAdapter.reserveStock(any())).thenAnswer(invocation -> {
             StockReservationRequest request = invocation.getArgument(0);
-            return new StockReservationResponse(true, request.sku(), 5, "Reserved");
+            return new StockReservationResponse(true, request.sku(), 5, "Reserved", new BigDecimal("10.00"));
         });
     }
 

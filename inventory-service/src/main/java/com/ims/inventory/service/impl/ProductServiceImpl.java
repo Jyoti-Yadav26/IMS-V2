@@ -125,9 +125,14 @@ public class ProductServiceImpl implements ProductService {
         log.info("Replaying idempotent reservation result for key={}", prior.getIdempotencyKey());
         if (prior.getStatus() == ReservationStatus.SUCCESS) {
             Product product = findBySkuOrThrow(prior.getSku());
-            return new StockReservationResponse(true, prior.getSku(), product.getQuantity(), prior.getMessage());
+            // remainingQuantity is current stock (the caller wants to know what is left now), but the
+            // price comes off the ledger row, not the product: a replay must answer with the price
+            // that was reserved, even if an admin has changed the product's price since.
+            return new StockReservationResponse(true, prior.getSku(), product.getQuantity(), prior.getMessage(),
+                    prior.getUnitPrice());
         }
-        return new StockReservationResponse(false, prior.getSku(), null, prior.getMessage());
+        // Nothing was reserved, so there is no reserved price to replay.
+        return new StockReservationResponse(false, prior.getSku(), null, prior.getMessage(), null);
     }
 
     /**

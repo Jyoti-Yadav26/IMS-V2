@@ -132,11 +132,18 @@ curl -X POST http://localhost:8080/api/inventory/products \
   -H "Content-Type: application/json" \
   -d '{"sku":"SKU-100","name":"Wireless Mouse","price":19.99,"quantity":10,"reorderThreshold":3}'
  
-# place an order
+# place an order ("unitPrice" is optional and ignored - see the note below)
 curl -X POST http://localhost:8080/api/orders \
   -H "Content-Type: application/json" \
   -d '{"customerEmail":"buyer@example.com","items":[{"sku":"SKU-100","quantity":8,"unitPrice":19.99}]}'
 ```
+
+> **Prices are not the caller's to set.** Each line item is priced by inventory-service as part
+> of reserving it, and the order's `totalAmount` is summed from those prices. A `unitPrice` in
+> the request body is accepted so that older clients keep working, but it is ignored entirely -
+> posting `"unitPrice":0.01` for a 19.99 product still produces a 19.99 order. Only a CONFIRMED
+> order carries a total; a REJECTED or FAILED one is 0, because its reserved stock was released
+> and nothing is owed.
  
 **Try it (Windows, PowerShell):**
  
@@ -149,7 +156,7 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/inventory/products
   -ContentType "application/json" `
   -Body '{"sku":"SKU-100","name":"Wireless Mouse","price":19.99,"quantity":10,"reorderThreshold":3}'
  
-# place an order
+# place an order ("unitPrice" is optional and ignored - see the note below)
 Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/orders `
   -ContentType "application/json" `
   -Body '{"customerEmail":"buyer@example.com","items":[{"sku":"SKU-100","quantity":8,"unitPrice":19.99}]}'

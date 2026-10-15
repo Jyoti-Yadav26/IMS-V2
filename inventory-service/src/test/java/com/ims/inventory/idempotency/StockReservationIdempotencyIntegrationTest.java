@@ -2,6 +2,7 @@ package com.ims.inventory.idempotency;
 
 import com.ims.inventory.dto.StockReservationRequest;
 import com.ims.inventory.dto.StockReservationResponse;
+import com.ims.inventory.entity.Product;
 import com.ims.inventory.entity.ReservationStatus;
 import com.ims.inventory.entity.StockReservation;
 import com.ims.inventory.service.ProductService;
@@ -9,6 +10,7 @@ import com.ims.inventory.support.AbstractPostgresIntegrationTest;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
@@ -64,6 +66,9 @@ class StockReservationIdempotencyIntegrationTest extends AbstractPostgresIntegra
         assertThat(replay.reserved()).isTrue();
         assertThat(first.remainingQuantity()).isEqualTo(REMAINING_QUANTITY);
         assertThat(replay.remainingQuantity()).isEqualTo(REMAINING_QUANTITY);
+        // Including the price: order-service bills from this number, so a retry must not move it.
+        assertThat(first.unitPrice()).isEqualByComparingTo("9.99");
+        assertThat(replay.unitPrice()).isEqualByComparingTo("9.99");
 
         // But the stock moved exactly once, and the ledger holds one row rather than two.
         assertThat(quantityOf(SKU))
@@ -72,6 +77,46 @@ class StockReservationIdempotencyIntegrationTest extends AbstractPostgresIntegra
         assertThat(successfulReservations())
                 .as("one reservation key, one ledger row")
                 .hasSize(1);
+    }
+
+    /**
+     * The price is part of the reserved outcome, so it has to be replayed like the rest of it.
+     *
+     * <p>This is the case that decides where the replayed price comes from. Reading
+     * {@code Product.price} at replay time would be cheaper and needs no column - but then a price
+     * change landing between a call and its retry makes the "idempotent" replay answer with a price
+     * that was never reserved. The reservation ledger therefore stores the price as of the
+     * reservation, and that is what this proves against real Postgres and a real column: the product
+     * is repriced between the two calls and the replay is unmoved.
+     *
+     * <p>It matters more than it looks, because order-service builds the order total out of these
+     * answers. Once a payment step exists, a retried line that silently reprices is the difference
+     * between charging what was reserved and charging whatever the price happens to be now.
+     */
+    @Test
+    void aReplayedKey_returnsThePriceAsOfTheReservationEvenAfterTheProductIsRepriced() {
+        givenProduct(SKU, STARTING_QUANTITY, 0); // fixture price: 9.99
+        StockReservationRequest request =
+                new StockReservationRequest(SKU, RESERVED_QUANTITY, "repriced-retry");
+
+        StockReservationResponse first = productService.reserveStock(request);
+        assertThat(first.unitPrice()).isEqualByComparingTo("9.99");
+
+        // An admin doubles the price between the original call and its retry.
+        Product repriced = productRepository.findBySku(SKU).orElseThrow();
+        repriced.setPrice(new BigDecimal("19.99"));
+        productRepository.saveAndFlush(repriced);
+
+        StockReservationResponse replay = productService.reserveStock(request);
+
+        assertThat(replay.unitPrice())
+                .as("a replay must answer with the price that was reserved, not the current one")
+                .isEqualByComparingTo("9.99");
+        assertThat(replay.reserved()).isTrue();
+        assertThat(quantityOf(SKU)).isEqualTo(REMAINING_QUANTITY);
+        assertThat(successfulReservations()).hasSize(1);
+        // The frozen price really is on the ledger row, not inferred anywhere.
+        assertThat(successfulReservations().get(0).getUnitPrice()).isEqualByComparingTo("9.99");
     }
 
     /**

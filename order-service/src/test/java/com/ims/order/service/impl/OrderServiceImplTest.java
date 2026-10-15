@@ -24,6 +24,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -47,6 +48,16 @@ class OrderServiceImplTest {
     private OrderServiceImpl orderService;
 
     private static final String ORDER_NUMBER = "ORD-TEST-1";
+
+    /** What inventory charges for each SKU in these tests - deliberately different from any price a request carries. */
+    private static final Map<String, BigDecimal> INVENTORY_PRICES = Map.of(
+            "SKU-1", new BigDecimal("10.00"),
+            "SKU-2", new BigDecimal("20.00"));
+
+    /** A successful reservation answered with inventory's own price for the requested sku. */
+    private static StockReservationResponse reservedAt(StockReservationRequest request) {
+        return new StockReservationResponse(true, request.sku(), 5, "ok", INVENTORY_PRICES.get(request.sku()));
+    }
 
     private OrderRequest twoItemRequest;
 
@@ -72,21 +83,136 @@ class OrderServiceImplTest {
 
     @Test
     void createOrder_confirmsWhenAllItemsReserved() {
-        when(inventoryClientAdapter.reserveStock(any())).thenReturn(new StockReservationResponse(true, "SKU", 5, "ok"));
+        // Prices come from inventory's answer, so the expected 40 below is 2x10 (SKU-1) + 1x20 (SKU-2)
+        // as priced by inventory - it is no longer the client's arithmetic.
+        when(inventoryClientAdapter.reserveStock(any())).thenAnswer(inv -> reservedAt(inv.getArgument(0)));
 
         OrderResponse response = orderService.createOrder(twoItemRequest);
 
         assertThat(response.status()).isEqualTo(OrderStatus.CONFIRMED);
-        assertThat(response.totalAmount()).isEqualTo(BigDecimal.valueOf(40));
+        assertThat(response.totalAmount()).isEqualByComparingTo("40.00");
         verify(inventoryClientAdapter, times(2)).reserveStock(any());
         verify(inventoryClientAdapter, never()).restock(any(), anyInt());
         verify(eventPublisher).publish(any(Order.class));
     }
 
     @Test
+    void createOrder_ignoresClientUnitPriceAndUsesInventoryPrice() {
+        // The client claims every line is free. Inventory says SKU-1 is 12.50 and SKU-2 is 20.00, and
+        // inventory is the only price anyone is allowed to believe: 2x12.50 + 1x20.00 = 45.00.
+        OrderRequest underpricedRequest = new OrderRequest("buyer@example.com", List.of(
+                new OrderItemRequest("SKU-1", 2, BigDecimal.ZERO),
+                new OrderItemRequest("SKU-2", 1, BigDecimal.ZERO)
+        ));
+        when(inventoryClientAdapter.reserveStock(any())).thenAnswer(inv -> {
+            StockReservationRequest request = inv.getArgument(0);
+            BigDecimal price = request.sku().equals("SKU-1") ? new BigDecimal("12.50") : new BigDecimal("20.00");
+            return new StockReservationResponse(true, request.sku(), 5, "ok", price);
+        });
+
+        OrderResponse response = orderService.createOrder(underpricedRequest);
+
+        assertThat(response.status()).isEqualTo(OrderStatus.CONFIRMED);
+        assertThat(response.totalAmount()).isEqualByComparingTo("45.00");
+        assertThat(response.items()).extracting(OrderItemResponse::unitPrice)
+                .containsExactly(new BigDecimal("12.50"), new BigDecimal("20.00"));
+    }
+
+    @Test
+    void createOrder_acceptsRequestWithoutUnitPrice() {
+        // unitPrice is optional now, because it is ignored anyway. A client that omits it entirely
+        // must still get a correctly priced order rather than a 400 or an NPE.
+        OrderRequest pricelessRequest = new OrderRequest("buyer@example.com", List.of(
+                new OrderItemRequest("SKU-1", 2, null),
+                new OrderItemRequest("SKU-2", 1, null)
+        ));
+        when(inventoryClientAdapter.reserveStock(any())).thenAnswer(inv -> reservedAt(inv.getArgument(0)));
+
+        OrderResponse response = orderService.createOrder(pricelessRequest);
+
+        assertThat(response.status()).isEqualTo(OrderStatus.CONFIRMED);
+        assertThat(response.totalAmount()).isEqualByComparingTo("40.00");
+    }
+
+    @Test
+    void createOrder_sumsDifferentPricesAcrossItems() {
+        OrderRequest request = new OrderRequest("buyer@example.com", List.of(
+                new OrderItemRequest("SKU-1", 3, BigDecimal.ONE),
+                new OrderItemRequest("SKU-2", 2, BigDecimal.ONE)
+        ));
+        when(inventoryClientAdapter.reserveStock(any())).thenAnswer(inv -> {
+            StockReservationRequest reservation = inv.getArgument(0);
+            BigDecimal price = reservation.sku().equals("SKU-1") ? new BigDecimal("1.05") : new BigDecimal("0.95");
+            return new StockReservationResponse(true, reservation.sku(), 5, "ok", price);
+        });
+
+        OrderResponse response = orderService.createOrder(request);
+
+        // 3 x 1.05 + 2 x 0.95
+        assertThat(response.totalAmount()).isEqualByComparingTo("5.05");
+    }
+
+    @Test
+    void createOrder_failsWhenInventoryReservesWithoutUnitPrice() {
+        // A reserved line with no price is a broken contract (most likely a version skew), not a
+        // business rejection: inventory answered, it just answered unusably. Falling back to the
+        // client's price is exactly the hole we are closing, so the order FAILS instead.
+        when(inventoryClientAdapter.reserveStock(argThat(r -> r != null && r.sku().equals("SKU-1"))))
+                .thenAnswer(inv -> reservedAt(inv.getArgument(0)));
+        when(inventoryClientAdapter.reserveStock(argThat((StockReservationRequest r) -> r != null && r.sku().equals("SKU-2"))))
+                .thenReturn(new StockReservationResponse(true, "SKU-2", 5, "ok", null));
+
+        OrderResponse response = orderService.createOrder(twoItemRequest);
+
+        assertThat(response.status()).isEqualTo(OrderStatus.FAILED);
+        assertThat(response.failureReason()).contains("SKU-2").contains("unitPrice");
+        assertThat(response.totalAmount()).isEqualByComparingTo("0");
+        // SKU-2's stock really was decremented, so it has to be released too - not just SKU-1.
+        verify(inventoryClientAdapter).restock("SKU-1", 2);
+        verify(inventoryClientAdapter).restock("SKU-2", 1);
+    }
+
+    @Test
+    void createOrder_rejectsWhenInventoryReportsNotReserved() {
+        // reserved=false is inventory saying no, which is a REJECTED order. It is how a replayed
+        // FAILED reservation answers (200 + reserved=false rather than a 409).
+        when(inventoryClientAdapter.reserveStock(argThat(r -> r != null && r.sku().equals("SKU-1"))))
+                .thenAnswer(inv -> reservedAt(inv.getArgument(0)));
+        when(inventoryClientAdapter.reserveStock(argThat((StockReservationRequest r) -> r != null && r.sku().equals("SKU-2"))))
+                .thenReturn(new StockReservationResponse(false, "SKU-2", null, "Insufficient stock for sku 'SKU-2'", null));
+
+        OrderResponse response = orderService.createOrder(twoItemRequest);
+
+        assertThat(response.status()).isEqualTo(OrderStatus.REJECTED);
+        assertThat(response.failureReason()).isEqualTo("Insufficient stock for sku 'SKU-2'");
+        assertThat(response.totalAmount()).isEqualByComparingTo("0");
+        verify(inventoryClientAdapter).restock("SKU-1", 2);
+        // Nothing was decremented for SKU-2, so restocking it would invent stock out of nothing.
+        verify(inventoryClientAdapter, never()).restock(eq("SKU-2"), anyInt());
+    }
+
+    @Test
+    void createOrder_zeroesTotalOnRejectedOrderButKeepsThePricesItWasGiven() {
+        when(inventoryClientAdapter.reserveStock(argThat(r -> r != null && r.sku().equals("SKU-1"))))
+                .thenAnswer(inv -> reservedAt(inv.getArgument(0)));
+        when(inventoryClientAdapter.reserveStock(argThat((StockReservationRequest r) -> r != null && r.sku().equals("SKU-2"))))
+                .thenThrow(new InsufficientStockException("not enough SKU-2"));
+
+        OrderResponse response = orderService.createOrder(twoItemRequest);
+
+        assertThat(response.status()).isEqualTo(OrderStatus.REJECTED);
+        // Nothing is owed on a rejected order - its stock was released - so the total is zero rather
+        // than a part-sum that reads like an amount due.
+        assertThat(response.totalAmount()).isEqualByComparingTo("0");
+        // The price inventory did quote is still on the line it quoted it for, as an audit trail.
+        assertThat(response.items()).extracting(OrderItemResponse::sku, OrderItemResponse::unitPrice)
+                .containsExactly(tuple("SKU-1", new BigDecimal("10.00")), tuple("SKU-2", null));
+    }
+
+    @Test
     void createOrder_rejectsAndCompensatesWhenSecondItemHasInsufficientStock() {
         when(inventoryClientAdapter.reserveStock(argThat(r -> r != null && r.sku().equals("SKU-1"))))
-                .thenReturn(new StockReservationResponse(true, "SKU-1", 5, "ok"));
+                .thenReturn(new StockReservationResponse(true, "SKU-1", 5, "ok", BigDecimal.TEN));
         when(inventoryClientAdapter.reserveStock(argThat(r -> r != null && r.sku().equals("SKU-2"))))
                 .thenThrow(new InsufficientStockException("not enough SKU-2"));
 
@@ -103,7 +229,7 @@ class OrderServiceImplTest {
     @Test
     void createOrder_marksFailedAndCompensatesWhenInventoryServiceUnavailable() {
         when(inventoryClientAdapter.reserveStock(argThat(r -> r != null && r.sku().equals("SKU-1"))))
-                .thenReturn(new StockReservationResponse(true, "SKU-1", 5, "ok"));
+                .thenReturn(new StockReservationResponse(true, "SKU-1", 5, "ok", BigDecimal.TEN));
         when(inventoryClientAdapter.reserveStock(argThat((StockReservationRequest r) -> r != null && r.sku().equals("SKU-2"))))
                 .thenThrow(new InventoryServiceUnavailableException("inventory-service is down", new RuntimeException()));
 
@@ -119,7 +245,7 @@ class OrderServiceImplTest {
         // release fails too (inventory-service down). The stock is therefore still decremented
         // downstream, so the order must not claim the line was released.
         when(inventoryClientAdapter.reserveStock(argThat(r -> r != null && r.sku().equals("SKU-1"))))
-                .thenReturn(new StockReservationResponse(true, "SKU-1", 5, "ok"));
+                .thenReturn(new StockReservationResponse(true, "SKU-1", 5, "ok", BigDecimal.TEN));
         when(inventoryClientAdapter.reserveStock(argThat((StockReservationRequest r) -> r != null && r.sku().equals("SKU-2"))))
                 .thenThrow(new InsufficientStockException("not enough SKU-2"));
         doThrow(new InventoryServiceUnavailableException("inventory-service is down", new RuntimeException()))
@@ -137,7 +263,8 @@ class OrderServiceImplTest {
 
     @Test
     void createOrder_persistsPendingOrderBeforeAttemptingReservation() {
-        when(inventoryClientAdapter.reserveStock(any())).thenReturn(new StockReservationResponse(true, "SKU", 5, "ok"));
+        when(inventoryClientAdapter.reserveStock(any()))
+                .thenReturn(new StockReservationResponse(true, "SKU", 5, "ok", BigDecimal.TEN));
 
         orderService.createOrder(twoItemRequest);
 
@@ -146,7 +273,8 @@ class OrderServiceImplTest {
 
     @Test
     void createOrder_usesLineItemIndexAsReservationIdempotencyKey() {
-        when(inventoryClientAdapter.reserveStock(any())).thenReturn(new StockReservationResponse(true, "SKU", 5, "ok"));
+        when(inventoryClientAdapter.reserveStock(any()))
+                .thenReturn(new StockReservationResponse(true, "SKU", 5, "ok", BigDecimal.TEN));
 
         orderService.createOrder(twoItemRequest);
 
@@ -198,7 +326,8 @@ class OrderServiceImplTest {
 
     @Test
     void createOrder_storesIdempotencyKeyOnTheNewOrder() {
-        when(inventoryClientAdapter.reserveStock(any())).thenReturn(new StockReservationResponse(true, "SKU", 5, "ok"));
+        when(inventoryClientAdapter.reserveStock(any()))
+                .thenReturn(new StockReservationResponse(true, "SKU", 5, "ok", BigDecimal.TEN));
 
         orderService.createOrder(twoItemRequest, "KEY-1");
 
@@ -211,7 +340,8 @@ class OrderServiceImplTest {
 
     @Test
     void createOrder_treatsBlankIdempotencyKeyAsAbsent() {
-        when(inventoryClientAdapter.reserveStock(any())).thenReturn(new StockReservationResponse(true, "SKU", 5, "ok"));
+        when(inventoryClientAdapter.reserveStock(any()))
+                .thenReturn(new StockReservationResponse(true, "SKU", 5, "ok", BigDecimal.TEN));
 
         OrderResponse response = orderService.createOrder(twoItemRequest, "   ");
 
