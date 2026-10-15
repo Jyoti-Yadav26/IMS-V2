@@ -169,11 +169,50 @@ curl.exe -X POST http://localhost:8080/api/inventory/products -H "Content-Type: 
 docker compose stop inventory-service
 ```
  
-Run tests (unit tests only, no DB/broker needed):
+## Running the tests
  
 ```bash
-mvn test
+mvn test                                # whole suite
+mvn verify                              # same tests, plus packaging
+mvn -pl inventory-service test          # one module
+mvn -pl order-service test -Dtest=OutboxRelayPostgresKafkaIntegrationTest
 ```
+ 
+**Docker Desktop must be running.** Three classes start real containers, because what they verify is
+database and broker behaviour rather than application logic - on H2 they would pass while production
+oversold:
+ 
+| Test | Containers | What it pins down |
+|---|---|---|
+| `OutboxRelayPostgresKafkaIntegrationTest` (order) | Postgres 16, Kafka | `FOR UPDATE SKIP LOCKED`, which H2 cannot parse; an order placed while the broker is unreachable is still placed, and its event is delivered once the broker returns |
+| `StockReservationConcurrencyIntegrationTest` (inventory) | Postgres 16 | 20 callers race for 1 unit of stock and exactly one wins - the `@Version` optimistic lock |
+| `StockReservationIdempotencyIntegrationTest` (inventory) | Postgres 16 | one idempotency key decrements stock once, sent both sequentially and simultaneously |
+ 
+Images match `docker-compose.yml` (`postgres:16-alpine`, `confluentinc/cp-kafka:7.5.3`), and
+Testcontainers' Ryuk sidecar removes the containers when the JVM exits. Without Docker these classes
+**skip** rather than fail, so the rest of the suite still runs.
+ 
+Everything else needs nothing external: Mockito unit tests, `@WebMvcTest` slices, `@SpringBootTest` on
+H2, `@EmbeddedKafka` listener tests, and a WireMock-backed circuit-breaker test.
+ 
+There is no failsafe plugin and no `*IT` naming - every test runs under surefire, so `mvn test` and
+`mvn verify` run the same set. `mvn test` therefore starts containers too; that is the trade-off for
+having one obvious way to run the suite.
+ 
+### Docker Engine 29: why `docker-java.properties` exists
+ 
+`inventory-service` and `order-service` each carry a one-line
+`src/test/resources/docker-java.properties` pinning `api.version=1.44`. Without it **no container
+starts**, and the symptom is misleading: the Testcontainers tests report as *skipped*, which looks like
+Docker simply not running.
+ 
+The Testcontainers version the Spring Boot 3.2.5 BOM manages (1.19.7) does not negotiate an API version.
+`DockerClientProviderStrategy.getClientForConfig` falls back to a hard-coded
+`RemoteApiVersion.VERSION_1_32` when none is configured, and Docker Engine 29 raised its *minimum*
+supported API version to 1.40 - so `/v1.32/info` comes back HTTP 400 and Testcontainers concludes there
+is no Docker environment. 1.44 is the ceiling: the highest version the shaded docker-java 3.3.6 knows.
+This is test-scoped configuration rather than a dependency change, and it can be deleted once the
+managed Testcontainers version moves past 1.19.x.
  
 ## Where to get help
  
