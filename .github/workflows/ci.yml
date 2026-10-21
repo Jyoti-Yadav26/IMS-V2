@@ -1,0 +1,51 @@
+# Continuous integration for the IMS multi-module Maven build.
+#
+# Scope: compile + unit tests + the Testcontainers integration tests, nothing else.
+# It deliberately does NOT run docker compose or the Python load tests (ims_load_test.py,
+# ims_cb_experiment.py) - those need the whole stack up and are run by hand.
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# One run per branch. Pushing again while a run is in progress cancels the older run
+# instead of queueing both.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          # Caches ~/.m2/repository keyed on the pom files, so later runs skip re-downloading
+          # the Spring Boot / Spring Cloud dependency tree.
+          cache: 'maven'
+
+      - name: Build and test
+        run: mvn -B clean verify
+
+      # Only on failure: the XML/TXT surefire reports say which test failed and why,
+      # which the job log alone often truncates.
+      - name: Upload surefire reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: '**/target/surefire-reports'
+          if-no-files-found: ignore
+          retention-days: 7

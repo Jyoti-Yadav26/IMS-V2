@@ -1,3 +1,5 @@
+[![CI](https://github.com/Jyoti-Yadav26/IMS-V2/actions/workflows/ci.yml/badge.svg)](https://github.com/Jyoti-Yadav26/IMS-V2/actions/workflows/ci.yml)
+
 # IMS — Inventory Management System
  
 A small microservices system (Java 17, Spring Boot 3) that places orders against
