@@ -7,6 +7,7 @@ Usage: python ims_cb_experiment.py --feign-cb true --run 1
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -20,6 +21,28 @@ ORDER_BODY = {
     "customerEmail": "cb-experiment@example.com",
     "items": [{"sku": SKU, "quantity": 1, "unitPrice": 9.99}],
 }
+
+# Since Step 11 the gateway requires a JWT on /api/orders. Without one every
+# trigger_failure() would be a 401 that never reaches order-service, so the
+# breaker would never trip and the experiment would just time out after its
+# 180s warmup. Same demo users and env overrides as ims_load_test.py; the login
+# helper is copied rather than shared, like the DTO contracts between services.
+CUSTOMER_USER = os.getenv("IMS_CUSTOMER_USER", "customer1")
+CUSTOMER_PASSWORD = os.getenv("IMS_CUSTOMER_PASSWORD", "customer-demo-pw")
+
+_token = None
+
+
+def login():
+    """Fetch a CUSTOMER token from the gateway's demo /auth/login."""
+    resp = requests.post(
+        f"{GATEWAY}/auth/login",
+        json={"username": CUSTOMER_USER, "password": CUSTOMER_PASSWORD},
+        timeout=10,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"login as {CUSTOMER_USER} failed: {resp.status_code} {resp.text}")
+    return resp.json()["accessToken"]
 
 
 def get_cb_detail():
@@ -55,7 +78,18 @@ def get_all_cb_states():
 
 def trigger_failure():
     try:
-        resp = requests.post(f"{GATEWAY}/api/orders", json=ORDER_BODY, timeout=30)
+        resp = requests.post(
+            f"{GATEWAY}/api/orders",
+            json=ORDER_BODY,
+            headers={"Authorization": f"Bearer {_token}"},
+            timeout=30,
+        )
+        # A 429 never reaches order-service, so it is neither a breaker trip nor
+        # a failure of the thing being measured. Surface it instead of letting
+        # it masquerade as a request that was tried: a run full of
+        # RATE_LIMITED is a mis-run, not a result.
+        if resp.status_code == 429:
+            return "RATE_LIMITED", 429
         body = resp.json() if resp.content else {}
         return body.get("status"), resp.status_code
     except requests.RequestException:
@@ -109,6 +143,9 @@ def main():
     parser.add_argument("--feign-cb", choices=["true", "false"], required=True)
     parser.add_argument("--run", type=int, required=True)
     args = parser.parse_args()
+
+    global _token
+    _token = login()
 
     opened, warmups, open_state, states_at_open = wait_until_open()
     if not opened:

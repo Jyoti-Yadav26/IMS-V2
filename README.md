@@ -206,6 +206,72 @@ There is no failsafe plugin and no `*IT` naming - every test runs under surefire
 `mvn verify` run the same set. `mvn test` therefore starts containers too; that is the trade-off for
 having one obvious way to run the suite.
  
+### Load and resilience scripts
+
+Two Python scripts in the repo root drive the running stack from outside. They are not part of
+`mvn test` - they need the whole system up, and they exist to produce numbers rather than to pass.
+
+```bash
+docker compose up --build          # all services, in another terminal
+pip install requests
+```
+
+| Command | What it proves |
+|---|---|
+| `python ims_load_test.py idempotency` | 10 concurrent `/reserve` calls sharing one `idempotencyKey` decrement stock once, not ten times |
+| `python ims_load_test.py concurrency` | 20 orders race for 10 units; exactly 10 are CONFIRMED, the rest REJECTED, stock lands at 0 |
+| `python ims_load_test.py flash [n_orders] [starting_qty]` | flash sale: 500 concurrent single-unit orders against 100 units. Reports CONFIRMED / REJECTED / FAILED / 429 and asserts `CONFIRMED + final stock == 100` with stock never negative. Exits non-zero if either assertion fails |
+| `python ims_load_test.py circuit-breaker` | response latency before and after the breaker opens (stop `inventory-service` first - see the docstring) |
+| `python ims_cb_experiment.py --feign-cb false --run 1` | open-circuit latency, measured only while actuator reports the breaker strictly OPEN. Prints one JSON object; the runs collected so far are in `cb_experiment_results_v2.json`. Needs the `CB-VERIFY01` product to exist already, which now takes an admin token to create |
+
+**The scripts log themselves in.** Every gateway route requires a JWT, so each scenario calls the
+demo `POST /auth/login` first - as `admin1` to create a product, as `customer1` to place orders.
+The defaults match the demo users in `api-gateway/src/main/resources/application.yml`; override them
+with `IMS_ADMIN_USER` / `IMS_ADMIN_PASSWORD` / `IMS_CUSTOMER_USER` / `IMS_CUSTOMER_PASSWORD` if you
+changed `CUSTOMER_PASSWORD_HASH` or `ADMIN_PASSWORD_HASH`.
+
+**Raise the rate limiter before `flash`.** The limiter's bucket is keyed on the caller
+(`UserOrIpKeyResolver`), so all 500 orders of a flash run share one bucket, and at the default 20
+requests/second with a burst of 40 roughly 440 of them come back `429` without ever reaching
+order-service. The run still passes its assertions - a throttled request never touched stock - but
+it stops being a test of concurrent stock reservation. The gateway reads these as environment
+variables, so the container has to be recreated for a change to apply:
+
+```powershell
+# PowerShell
+$env:RATE_LIMIT_REPLENISH_RATE=2000; $env:RATE_LIMIT_BURST_CAPACITY=4000
+docker compose up -d --force-recreate api-gateway
+```
+
+```bash
+# bash / Git Bash
+RATE_LIMIT_REPLENISH_RATE=2000 RATE_LIMIT_BURST_CAPACITY=4000 \
+  docker compose up -d --force-recreate api-gateway
+```
+
+Drop the variables and recreate the gateway again to put the production-ish limit back. Leaving the
+limiter at 20/s and watching the `429` count climb is itself a useful demo - just not at the same
+time as the oversell test.
+
+**Two calls deliberately skip the gateway**, both on `localhost:8081`:
+`reserve_stock_direct` (the gateway neither routes nor permits `/api/inventory/reserve` - it is the
+internal saga endpoint order-service reaches over Feign) and `get_stock`, which reads the stock the
+assertions are made against. A measurement must not be able to fail because the burst it just fired
+emptied its own rate-limit bucket.
+
+#### Results
+
+Filled in from real runs - paste the raw script output under the table rather than summarising it.
+
+| Date | Mode | Orders | Stock | CONFIRMED | REJECTED | FAILED | 429 | Final stock | Assertions | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|
+|  | flash |  |  |  |  |  |  |  |  |  |
+|  | concurrency |  |  |  |  |  |  |  |  |  |
+|  | idempotency |  |  |  |  |  |  |  |  |  |
+
+Open-circuit latency runs live in `cb_experiment_results_v2.json` (and the older
+`cb_experiment_results.json`, whose key names predate the current script).
+
 ### Docker Engine 29: why `docker-java.properties` exists
  
 `inventory-service` and `order-service` each carry a one-line
