@@ -1,269 +1,432 @@
 [![CI](https://github.com/Jyoti-Yadav26/IMS-V2/actions/workflows/ci.yml/badge.svg)](https://github.com/Jyoti-Yadav26/IMS-V2/actions/workflows/ci.yml)
 
 # IMS — Inventory Management System
- 
-A small microservices system (Java 17, Spring Boot 3) that places orders against
-live inventory. Built to demonstrate real service-to-service communication
-patterns, not just CRUD behind a REST API.
- 
-## What it does
- 
-- Manages products and stock levels (`inventory-service`)
-- Places orders that reserve stock in real time (`order-service`)
-- Sends notifications on order events and low-stock alerts (`notification-service`)
-- Routes all traffic through one gateway, with services found dynamically via
-  a service registry — no hard-coded hosts
-## Why it's useful
- 
-Most demo microservice projects show the happy path only. This one shows what
-breaks under real conditions, and how the code handles it:
- 
-- A synchronous call (order → inventory) that must not cascade-fail when the
-  dependency is slow or down
-- Asynchronous events (Kafka) for side effects that shouldn't block the main request
-- Concurrency bugs (double-charging, overselling stock) and how they were found
-  and fixed under load, not just assumed away
-If you're learning resilience patterns (circuit breaker, retry, idempotency,
-optimistic locking, saga/compensation) and want to see them as working code
-instead of slideware, this is that.
- 
+
+Microservices (Java 17, Spring Boot 3.2.5) that place orders against live inventory and survive the
+failure modes a demo normally hides: a dependency that is down, a broker that is down, a double-clicked
+button, and 500 customers racing for 100 units.
+
+- `inventory-service` owns products, stock and prices
+- `order-service` runs the order saga: reserve each line item, compensate on failure, publish one event
+- `notification-service` consumes those events and records exactly one notification per event
+- `api-gateway` is the only public entry point: JWT authentication, role checks and per-caller rate limiting
+- `eureka-server` is the registry; nothing addresses another service by host
+
 ## Architecture
- 
+
 ```mermaid
 flowchart LR
     Client([Client])
- 
-    subgraph Platform
-        GW[api-gateway<br/>:8080]
-        EU[eureka-server<br/>:8761]
+
+    subgraph Edge
+        GW["api-gateway :8080<br/>JWT + rate limit"]
+        RD[("Redis<br/>rate-limit buckets")]
     end
- 
-    subgraph Services
-        INV[inventory-service<br/>:8081]
-        ORD[order-service<br/>:8082]
-        NOT[notification-service<br/>:8083]
+
+    EU["eureka-server :8761"]
+
+    subgraph ORDSVC["order-service :8082"]
+        SAGA["createOrder saga"]
+        RELAY["OutboxRelay<br/>@Scheduled 1s"]
     end
- 
-    subgraph Data
-        PGI[(postgres<br/>inventory_db)]
-        PGO[(postgres<br/>order_db)]
-        PGN[(postgres<br/>notification_db)]
-        KAFKA{{Kafka}}
-    end
- 
-    Client -->|HTTP| GW
-    GW -->|/api/inventory/**| INV
-    GW -->|/api/orders/**| ORD
-    GW -->|/api/notifications/**| NOT
- 
+
+    INV["inventory-service :8081"]
+    NOT["notification-service :8083"]
+
+    PGO[("postgres<br/>order_db<br/>orders + outbox_events")]
+    PGI[("postgres<br/>inventory_db")]
+    PGN[("postgres<br/>notification_db")]
+    KAFKA{{"Kafka<br/>order-events · low-stock-events<br/>+ .DLT"}}
+
+    Client -->|"Bearer JWT"| GW
+    GW <--> RD
+    GW -->|"/api/orders/**"| SAGA
+    GW -->|"/api/inventory/products**"| INV
+    GW -->|"/api/notifications/** (ADMIN)"| NOT
+
+    GW -. discovers .-> EU
+    SAGA -. registers .-> EU
     INV -. registers .-> EU
-    ORD -. registers .-> EU
     NOT -. registers .-> EU
-    GW -. discovers via .-> EU
- 
-    ORD -->|"REST (sync)<br/>reserve/restock<br/>+ circuit breaker + retry"| INV
- 
+
+    SAGA ==>|"Feign reserve / restock — bypasses the gateway<br/>@CircuitBreaker outside @Retry"| INV
+
+    SAGA -->|"order + event row,<br/>one transaction"| PGO
+    PGO -->|"claim NEW rows<br/>FOR UPDATE SKIP LOCKED"| RELAY
+    RELAY -->|"order-events"| KAFKA
     INV --> PGI
-    ORD --> PGO
+    INV -->|"low-stock-events"| KAFKA
+    KAFKA --> NOT
     NOT --> PGN
- 
-    ORD -->|publish OrderEvent| KAFKA
-    INV -->|publish LowStockEvent| KAFKA
-    KAFKA -->|consume| NOT
 ```
- 
-| Service | Port | Responsibility |
-|---|---|---|
-| `eureka-server` | 8761 | Service registry |
-| `api-gateway` | 8080 | Single entry point, routes by service name |
-| `inventory-service` | 8081 | Product/stock data, `reserve`/`restock`, publishes `LowStockEvent` |
-| `order-service` | 8082 | Places orders, calls inventory sync, runs saga on partial failure, publishes `OrderEvent` |
-| `notification-service` | 8083 | Consumes events from Kafka, logs/persists notifications |
- 
-Each service has its own database ("database per service"). Nothing reaches
-across a DB boundary; the DTOs order-service uses to talk to inventory-service
-are hand-duplicated rather than shared, trading manual sync for independent
+
+| Module | Port | Database | Role |
+|---|---|---|---|
+| `eureka-server` | 8761 | – | Service registry |
+| `api-gateway` | 8080 | – | Auth, routing by service name, rate limiting (Redis) |
+| `inventory-service` | 8081 | `inventory_db` | Products, stock, prices, `/reserve`, `/restock`, `LowStockEvent` |
+| `order-service` | 8082 | `order_db` | Order saga, outbox, `OrderEvent` |
+| `notification-service` | 8083 | `notification_db` | Kafka listeners, `Notification` rows, DLT routing |
+
+Each service owns its database and nothing reads across a boundary. The DTOs and events shared between
+services are **hand-duplicated copies**, not a shared library — manual sync in exchange for independent
 deployability.
- 
-**Resilience patterns implemented** (each is real code, not a framework default):
- 
-- **Circuit breaker + retry + timeout** on the order→inventory call (Resilience4j)
-- **No retry on business errors** — a 409 (insufficient stock) or 404 (unknown SKU)
-  is not retried and doesn't count against the circuit breaker
-- **Idempotency** — `reserve` takes an idempotency key; a repeated call replays
-  the original result instead of double-decrementing stock
-- **Optimistic locking** — concurrent reservations against the same SKU use a
-  `@Version` column with bounded retry, so stock is never oversold or silently lost
-- **Saga with compensation** — a multi-item order reserves items one at a time;
-  if one fails, already-reserved items are restocked and the order is marked
-  `REJECTED`/`FAILED`. The order row is persisted `PENDING` before any remote
-  call, so there's always a durable record even if the process crashes mid-saga
-- **Graceful degradation** — `POST /api/orders` always returns `201`; whether
-  the order could actually be fulfilled is carried in `status`/`failureReason`,
-  not a `503` that discards the fact the order was received
-- **Kafka consumer resilience** — deserialization errors and poison-pill
-  messages route to a `<topic>.DLT` dead-letter topic instead of wedging a
-  partition or being silently dropped
-## How to run it
- 
-**Docker Compose (everything, one command)** — requires Docker Desktop:
- 
+
+Two things in the diagram are deliberate. `order-service → inventory-service` goes straight over Feign
+and Eureka, never through the gateway: `/api/inventory/reserve` is internal, is not matched by any
+gateway route, and is denied by the gateway's security chain even for ADMIN. And the gateway talks to
+Redis only for rate-limit buckets — no session, no token state.
+
+**Who may call what** (enforced at the gateway only; the services themselves trust their caller):
+
+| Endpoint | Required |
+|---|---|
+| `POST /auth/login` | public (demo issuer, see below) |
+| `GET /api/inventory/products`, `/products/{sku}` | any valid token |
+| `POST /api/inventory/products`, `POST /api/inventory/products/{sku}/restock` | `ADMIN` |
+| `POST /api/orders`, `GET /api/orders/**` | any valid token |
+| `GET /api/notifications` | `ADMIN` (rows are not user-scoped) |
+| `/api/inventory/reserve` | denied, and not routed |
+| `/actuator/**` on the gateway | denied except `/actuator/health` |
+
+## Request flow
+
+1. `POST /auth/login` returns an HS256 JWT (`accessToken`, 15 min).
+2. `POST /api/orders` with that bearer token, and optionally an `Idempotency-Key` header. The gateway
+   checks the token, strips any client-supplied `X-User-Id` / `X-User-Roles`, sets `X-User-Id` from the
+   token subject, and spends one rate-limit token for that caller.
+3. If the key was seen before, the stored order is returned and nothing is reserved again. A request
+   repeating a SKU across two lines is rejected with 400 — the two lines would otherwise share one
+   reservation key.
+4. The order is saved `PENDING`, then each line item is reserved over Feign with the key
+   `{orderNumber}-{itemIndex}`. **Inventory returns the price**; the request's `unitPrice` is ignored,
+   and `totalAmount` is summed from what inventory charged.
+5. Outcome: all items reserved → `CONFIRMED`. Inventory refused (no stock / unknown SKU) → `REJECTED`.
+   Inventory unreachable, retries exhausted, circuit open, or a reserved line came back unpriced →
+   `FAILED`. Either failure compensates first: every already-reserved line is restocked.
+6. The event is written as an `outbox_events` row **in the order's transaction** — no broker call on the
+   request thread. `POST /api/orders` answers `201` in all three cases; the outcome is in `status` and
+   `failureReason`.
+7. `OutboxRelay` wakes once a second, claims up to 100 `NEW` rows with `FOR UPDATE SKIP LOCKED`, sends
+   each to Kafka keyed by order number, and marks it `SENT`.
+8. `notification-service` consumes `order-events`, de-duplicates on the event's `eventId`, and writes
+   one `Notification`.
+
+## What changed from v1
+
+| Issue in v1 | Fix in v2 | Test that proves it |
+|---|---|---|
+| Aspect order was `@Retry` outside `@CircuitBreaker`, so the inner fallback converted the first failure before retry could try again; a workaround then added `CallNotPermittedException` + `InventoryServiceUnavailableException` to retry's `ignore-exceptions`, silently killing all retries | `circuit-breaker-aspect-order: 1` / `retry-aspect-order: 2` — the breaker is the outer aspect, so an open circuit fails fast and retry gets all 3 attempts against the real downstream. `ignore-exceptions` is back to the two business exceptions, and `spring.cloud.openfeign.circuitbreaker.enabled: false` removes the second, redundant breaker | `InventoryResilienceIntegrationTest.inventoryError_retriesThreeTimesThenFails`, `.circuitOpen_failsFastWithZeroCalls` |
+| `reserveStockFallback(.., Throwable)` swallowed business exceptions, so an over-order ended `FAILED` instead of `REJECTED` — listing an exception under `ignore-exceptions` keeps it out of the breaker's statistics but does **not** stop the fallback firing | The fallback rethrows `InsufficientStockException` / `ProductNotFoundException` unchanged | `InventoryResilienceIntegrationTest.insufficientStock_rejectsWithExactlyOneCall` |
+| `JsonSerializer` stamped the producer's class name into `__TypeId__`; notification-service trusts only its own package, so **every** event failed type resolution and went straight to `<topic>.DLT`. Not one notification was ever saved | Producers publish a logical token (`order-event`, `low-stock-event`) via `TYPE_MAPPINGS`; the consumer maps those tokens to its own records, with `TRUSTED_PACKAGES` as a backstop. The token is the wire contract, the class names behind it stay private to each service | `OrderEventKafkaTypeMappingIntegrationTest.orderEventWithMappedTypeToken_isPersistedAsNotification` and `.orderEventWithRawClassNameHeader_isRoutedToDeadLetterTopic` |
+| The same SKU twice in one order produced the same reservation key, so the second line was replayed without decrementing — an oversell | Duplicate SKUs are rejected with 400; the reservation key became `orderNumber + "-" + itemIndex` | `OrderServiceImplTest.createOrder_rejectsDuplicateSkuInSameOrder`, `.createOrder_usesLineItemIndexAsReservationIdempotencyKey` |
+| `restockFallback` swallowed failures, so compensation marked items `reserved=false` and logged "Compensated" even when the restock had failed | The fallback rethrows; the item stays `reserved=true` and the saga logs `COMPENSATION FAILED` with order, SKU and quantity | `InventoryResilienceIntegrationTest.restockFailure_compensationCallsOnlyOnce`, `OrderServiceImplTest.createOrder_leavesItemReservedWhenCompensatingRestockFails` |
+| Malformed JSON and `@Min` violations returned 500; `order_items.order_id` had no index | `HttpMessageNotReadableException` and `ConstraintViolationException` handlers in both services return 400, and the generic 500 now logs the exception and returns a fixed message instead of leaking internals. `@Index(name = "idx_order_items_order_id")` on `OrderItem` | `OrderControllerErrorHandlingTest`, `ProductControllerErrorHandlingTest` — both cover the malformed body, the constraint violation and that a 500 leaks nothing |
+| No idempotency on `POST /api/orders`: a double click placed two orders | Optional `Idempotency-Key` header, nullable+unique `orders.idempotency_key`, a pre-check in `createOrder`, and the concurrent duplicate resolved by `IdempotentOrderCreator` catching the constraint violation and returning the winner | `OrderIdempotencyIntegrationTest.sameIdempotencyKeyTwice_createsOneOrderAndReservesEachItemOnce`, `IdempotentOrderCreatorTest.create_returnsTheWinningOrderWhenAConcurrentRequestInsertedTheSameKey` |
+| The Kafka send happened inside the order transaction, before commit, with failures only logged — a dual write | `OrderEventPublisher.publish` writes an `OutboxEvent` row in the order's transaction; `OutboxRelay` sends after commit, claiming rows with `FOR UPDATE SKIP LOCKED`; `OrderEvent` gained a durable `eventId` | `OutboxRelayPostgresKafkaIntegrationTest.anOrderPlacedWhileKafkaIsDown_isStillPlacedAndItsEventIsDeliveredOnceKafkaIsBack`, `OutboxRelayTest`, `OrderEventPublisherTest` |
+| The notification consumer was not idempotent, so an at-least-once redelivery emailed the customer twice | Nullable+unique `notifications.event_id`; `NotificationService.send` skips on `existsByEventId` and swallows a concurrent `23505` on that constraint. `LowStockEvent` also carries an `eventId` now | `OrderEventIdempotentConsumerIntegrationTest.theSameOrderEventDeliveredTwice_createsExactlyOneNotification`, `NotificationServiceTest.send_whenAConcurrentDuplicateTripsTheUniqueConstraint_treatsItAsAlreadyDone` |
+| Docker Engine 29 made the container tests report as *skipped*, which looks exactly like Docker not running | A one-line `src/test/resources/docker-java.properties` pinning `api.version=1.44` in the three modules that use Testcontainers | The suite runs those classes instead of skipping them — see "Docker Engine 29" below |
+| Concurrency and idempotency were asserted on H2, where they pass while production oversells | Real-Postgres integration tests: 20 threads racing for one unit, and one idempotency key sent both sequentially and simultaneously | `StockReservationConcurrencyIntegrationTest`, `StockReservationIdempotencyIntegrationTest` |
+| The order total came from the request body, so a client could price its own order | `StockReservationResponse` carries `unitPrice` from `Product.price`; `OrderItem.unitPrice` and `Order.totalAmount` are built from inventory's answer, and a replayed reservation returns the price as of the reservation rather than today's | `OrderServiceImplTest.createOrder_ignoresClientUnitPriceAndUsesInventoryPrice`, `StockReservationIdempotencyIntegrationTest.aReplayedKey_returnsThePriceAsOfTheReservationEvenAfterTheProductIsRepriced` |
+| Every endpoint was public and unmetered | Gateway-only HS256 JWT (WebFlux resource server) with role rules, `X-User-Id` asserted from the token after stripping the client's, and a Redis `RequestRateLimiter` keyed on user then IP | `GatewayAuthIntegrationTest` (roles, expiry, bad signature, spoofed headers, `/reserve` denied even for ADMIN, actuator locked down), `GatewayRateLimitIntegrationTest`, `GatewayRateLimiterFailOpenIntegrationTest` |
+| Nothing exercised the system at flash-sale concurrency | `ims_load_test.py flash`: 500 concurrent orders against 100 units, asserting `CONFIRMED + final stock == starting stock` and that stock never goes negative. It surfaced orders coming back as HTTP 500 instead of a `FAILED` body — the two Resilience4j fallbacks were `private` and are now package-private | `ims_load_test.py flash`. **No JVM test pins that visibility**: `InventoryResilienceIntegrationTest` passes with the fallbacks private too (measured) |
+| No automated build | GitHub Actions on push and PR to `main`: JDK 17, `mvn -B clean verify`, surefire reports uploaded on failure. Docker is available on the runner, so the container tests really run | the badge at the top |
+
+## Guarantees
+
+| Guarantee | Mechanism | Test |
+|---|---|---|
+| **No oversell** | `@Version` optimistic locking on `Product`, plus a bounded retry loop in `ProductServiceImpl` | `StockReservationConcurrencyIntegrationTest.twentySimultaneousReservationsOfOneUnit_sellItExactlyOnce` — 20 threads released together against 1 unit: exactly one `RESERVED`, the other 19 split between "insufficient stock" and "too much contention", both correct answers. Delete `@Version` and the test fails |
+| **Idempotent order placement** | unique `orders.idempotency_key`, pre-check plus `IdempotentOrderCreator` for the race | `OrderIdempotencyIntegrationTest.sameIdempotencyKeyTwice_createsOneOrderAndReservesEachItemOnce`, `IdempotentOrderCreatorTest.create_returnsTheWinningOrderWhenAConcurrentRequestInsertedTheSameKey` |
+| **Idempotent reservations** | a `stock_reservations` ledger keyed on the idempotency key; a replay returns the stored outcome and the stored price | `StockReservationIdempotencyIntegrationTest.theSameKeySentTwiceInSequence_decrementsStockOnce`, `.theSameKeySentTwiceAtOnce_stillDecrementsStockOnce` |
+| **No lost events** | the event row and the order commit together; the relay sends afterwards and keeps the row `NEW` until Kafka acknowledges | `OutboxRelayPostgresKafkaIntegrationTest.anOrderPlacedWhileKafkaIsDown_isStillPlacedAndItsEventIsDeliveredOnceKafkaIsBack`, `OrderEventPublisherTest.publish_writesExactlyOneNewOutboxRowForTheOrder` |
+| **No duplicate notifications** | a stable `eventId` per event, `existsByEventId`, and the unique `uk_notifications_event_id` behind it | `OrderEventIdempotentConsumerIntegrationTest.theSameOrderEventDeliveredTwice_createsExactlyOneNotification`, `NotificationServiceTest` (including the concurrent duplicate and a blank id) |
+
+Delivery is at-least-once, not exactly-once, and deliberately so: the relay can crash after Kafka's ack
+but before the row is marked `SENT`. The consumer's de-duplication is what turns that into "one
+notification per event", which is why both halves exist.
+
+## Failure scenarios
+
+**inventory-service slow or down.** Each reserve gets 3 attempts with exponential backoff (300 ms base).
+After 5 calls in a 10-call window with a 50% failure rate the breaker opens for 15 s, then probes with 3
+calls. While it is open, calls fail immediately without entering the retry layer: the integration test
+asserts `FAILED` in under 100 ms with **zero** downstream calls. The order is still recorded, with
+`status=FAILED` and the reason — `POST /api/orders` never answers 503.
+
+**Kafka down.** Nothing on the request thread touches the broker, so orders are placed normally and the
+event sits `NEW` in `outbox_events`. The relay retries once a second, incrementing `attempts`, and stops
+each batch at the first send failure to preserve per-order ordering. A row that can *never* be sent
+(unknown `eventType`, unreadable payload) is logged, counted and skipped instead, so it cannot wedge the
+queue behind it.
+
+**A duplicate event.** The consumer sees an `eventId` it already has, logs "Skipping duplicate event" and
+writes nothing. If two threads or replicas race past that check, the unique constraint decides and the
+loser treats `23505` as proof the work is done, rather than letting it stall the partition for three
+retries.
+
+**A retry after a timeout where the first call actually succeeded.** The reservation key
+(`{orderNumber}-{itemIndex}`) is already in the ledger, so inventory replays the stored outcome — and the
+stored price — instead of decrementing again.
+
+**Redis down.** Spring Cloud Gateway's `RequestRateLimiter` fails open: requests are still served,
+unmetered, and authentication still applies. The Redis health indicator is switched off on purpose so a
+Redis outage does not mark a working gateway `DOWN`. Covered by
+`GatewayRateLimiterFailOpenIntegrationTest`, which points Lettuce at a closed port and needs no Docker.
+
+**A compensating restock fails.** The item stays `reserved=true`, the saga logs
+`COMPENSATION FAILED: order=… sku=… quantity=…` and carries on with the other lines, so the order row
+records exactly what inventory still has decremented. `restock` deliberately has no `@Retry`: releasing
+stock is not idempotent, so a retry after a lost response would release it twice.
+
+## Known limitations
+
+- **The services are published on their own ports** (8081/8082/8083) in `docker-compose.yml`, so anything
+  on the host can skip the gateway and its auth entirely. Convenient for the load scripts and for reading
+  `/actuator/health`; it means the authorisation story holds only for traffic arriving on 8080.
+- **`/auth/login` is not rate limited.** It is a controller on the gateway, not a route, so the
+  `default-filters` limiter never sees it. No lockout, no captcha.
+- **No token revocation.** A leaked token stays valid until it expires (15 min). There is no refresh token
+  either.
+- **HS256 with a shared secret**, and the gateway is both issuer and verifier. Production would validate
+  RS256 against an identity provider's JWKS (Keycloak or similar) so nothing but the IdP can mint a token.
+  The two demo users are hard-coded in `application.yml`.
+- **`createOrder` is still one transaction**, so the `PENDING` row is not committed before the remote
+  calls: a crash mid-saga rolls the attempt back rather than leaving an auditable `PENDING` order. Known,
+  and not fixed in v2 — fixing it properly means splitting the saga into separately committed steps.
+- **Compensation is a restock call** that can itself fail. When it does, the drift is logged and visible
+  on the order row, but nothing reconciles it automatically.
+- **The `FAILED` notification text promises a retry that does not exist** ("We'll retry automatically").
+  Nothing re-drives a `FAILED` order today.
+- **One Kafka broker, and topics are auto-created** with the broker's default single partition, the
+  `.DLT` topics included. There are no `NewTopic` beans and the listener containers run at concurrency 1,
+  so consumer parallelism is capped at one per topic.
+- **`OrderEvent` is duplicated** in `order-service` and `notification-service` with no contract test. The
+  kebab-case type token is the only agreement between them; a field added on one side and forgotten on
+  the other is caught by nothing.
+- **`SENT` outbox rows are never deleted.** The table grows forever. The index on `(status, id)` keeps the
+  relay's poll cheap, but a cleanup job is still missing.
+- **`LowStockEvent` is published before commit**, from inside the reservation transaction, and its
+  `eventId` is minted at send time rather than stored — so it is still a dual write, and an
+  optimistic-lock retry can alert the admin twice. Deliberate: a duplicate internal alert did not justify
+  a second outbox.
+- **The container tests skip silently without Docker.** `mvn test` is then green while five classes — the
+  ones that prove `SKIP LOCKED`, the `@Version` race, reservation idempotency, and the gateway's auth and
+  rate limiting — never ran.
+- **Nothing in `mvn test` pins the Resilience4j fallback visibility.** Making both fallbacks `private`
+  again still leaves `InventoryResilienceIntegrationTest` green (verified), so only the flash script would
+  catch that regression.
+
+## Decisions, and what I'd change
+
+- **Duplicated DTOs instead of a shared library.** Costs manual sync when a contract changes; buys
+  genuine independent deployability. Worth revisiting once drift becomes a real bug source — a
+  consumer-driven contract test is the cheaper half-step.
+- **A hand-written saga instead of a distributed transaction.** Easier to reason about and debug than 2PC,
+  but the compensation is written per failure mode and does not scale past a handful of steps. An
+  orchestrator (or an outbox-driven saga) is the next move if the flow grows past "reserve N items, roll
+  back on failure".
+- **`POST /api/orders` always answers 201.** The right call — "we recorded your order" and "we can fulfil
+  it" are different questions — but it obliges every client to read `status`, which is easy to forget. A
+  webhook would let clients stop inspecting the body.
+- **The gateway is a single instance.** Everything downstream is protected; the front door is not. If the
+  gateway dies the platform is unreachable from outside, however healthy the three services are.
+  Kubernetes is the planned fix — replicas behind a Service, readiness/liveness probes, and discovery via
+  the Kubernetes API instead of Eureka — which is also where restart-on-crash and rolling deploys come
+  from. None of that is needed to demonstrate the patterns here; it matters when the bar moves from
+  "these patterns work" to "this holds production traffic".
+
+## How to run
+
+Requires Docker Desktop, plus JDK 17 and Maven for the tests.
+
 ```bash
 docker compose up --build
 ```
- 
-- Eureka dashboard: http://localhost:8761
-- API Gateway (use for all calls): http://localhost:8080
-**Run locally with Maven** (for iterating on one service):
- 
+
+That brings up Zookeeper, Kafka, three Postgres instances, Redis, Eureka, the gateway and the three
+services. Eureka dashboard: <http://localhost:8761>. Everything else goes through
+<http://localhost:8080>.
+
+To iterate on one service locally:
+
 ```bash
-docker compose up zookeeper kafka postgres-inventory postgres-order postgres-notification
+docker compose up zookeeper kafka postgres-inventory postgres-order postgres-notification redis
 mvn clean install -DskipTests
-mvn spring-boot:run -pl eureka-server
-mvn spring-boot:run -pl api-gateway
-mvn spring-boot:run -pl inventory-service
-mvn spring-boot:run -pl order-service
-mvn spring-boot:run -pl notification-service
-```
- 
-**Try it (macOS/Linux/WSL/Git Bash):**
- 
-```bash
-# create a product
-curl -X POST http://localhost:8080/api/inventory/products \
-  -H "Content-Type: application/json" \
-  -d '{"sku":"SKU-100","name":"Wireless Mouse","price":19.99,"quantity":10,"reorderThreshold":3}'
- 
-# place an order ("unitPrice" is optional and ignored - see the note below)
-curl -X POST http://localhost:8080/api/orders \
-  -H "Content-Type: application/json" \
-  -d '{"customerEmail":"buyer@example.com","items":[{"sku":"SKU-100","quantity":8,"unitPrice":19.99}]}'
+mvn spring-boot:run -pl eureka-server     # then api-gateway, inventory-service, order-service, notification-service
 ```
 
-> **Prices are not the caller's to set.** Each line item is priced by inventory-service as part
-> of reserving it, and the order's `totalAmount` is summed from those prices. A `unitPrice` in
-> the request body is accepted so that older clients keep working, but it is ignored entirely -
-> posting `"unitPrice":0.01` for a 19.99 product still produces a 19.99 order. Only a CONFIRMED
-> order carries a total; a REJECTED or FAILED one is 0, because its reserved stock was released
-> and nothing is owed.
- 
-**Try it (Windows, PowerShell):**
- 
-curl.exe on Windows exists, but PowerShell's quoting rules break the single-quote
-JSON body above. Use `Invoke-RestMethod` instead — it's the native equivalent:
- 
+### Demo users
+
+Two in-memory accounts, issued by the gateway's demo `POST /auth/login`. The passwords are BCrypt hashes
+in `api-gateway/src/main/resources/application.yml`; override them with `CUSTOMER_PASSWORD_HASH` /
+`ADMIN_PASSWORD_HASH` (double every `$` when passing a hash through compose).
+
+| User | Password | Role |
+|---|---|---|
+| `customer1` | `customer-demo-pw` | `CUSTOMER` |
+| `admin1` | `admin-demo-pw` | `ADMIN` |
+
+`JWT_SECRET` must be at least 32 bytes — the gateway refuses to start otherwise. `docker-compose.yml`
+carries a dev-only default; a real deployment injects it from a secret store.
+
+### Try it
+
+```bash
+# 1. log in as the admin and keep the token
+ADMIN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin1","password":"admin-demo-pw"}' | sed -n 's/.*"accessToken":"\([^"]*\)".*/\1/p')
+
+# 2. create a product (ADMIN only)
+curl -X POST http://localhost:8080/api/inventory/products \
+  -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
+  -d '{"sku":"SKU-100","name":"Wireless Mouse","price":19.99,"quantity":10,"reorderThreshold":3}'
+
+# 3. log in as the customer and place an order
+CUST=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"customer1","password":"customer-demo-pw"}' | sed -n 's/.*"accessToken":"\([^"]*\)".*/\1/p')
+
+curl -X POST http://localhost:8080/api/orders \
+  -H "Authorization: Bearer $CUST" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: demo-order-1" \
+  -d '{"customerEmail":"buyer@example.com","items":[{"sku":"SKU-100","quantity":8}]}'
+```
+
+Repeat step 3 unchanged: the same order comes back and stock is still 2. Then stop `inventory-service`
+and order again to watch the breaker open — `http://localhost:8082/actuator/health` reports its state.
+
+> **Prices are not the caller's to set.** `unitPrice` is accepted in the request body so older clients
+> keep working, and then ignored: posting `"unitPrice":0.01` for a 19.99 product still produces a 19.99
+> order. Only a `CONFIRMED` order carries a total; `REJECTED` and `FAILED` are 0, because their stock was
+> released and nothing is owed.
+
+On Windows, PowerShell's quoting breaks the single-quoted JSON above — use `Invoke-RestMethod`:
+
 ```powershell
-# create a product
+$admin = (Invoke-RestMethod -Method Post -Uri http://localhost:8080/auth/login `
+  -ContentType "application/json" `
+  -Body '{"username":"admin1","password":"admin-demo-pw"}').accessToken
+
 Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/inventory/products `
-  -ContentType "application/json" `
+  -Headers @{ Authorization = "Bearer $admin" } -ContentType "application/json" `
   -Body '{"sku":"SKU-100","name":"Wireless Mouse","price":19.99,"quantity":10,"reorderThreshold":3}'
- 
-# place an order ("unitPrice" is optional and ignored - see the note below)
-Invoke-RestMethod -Method Post -Uri http://localhost:8080/api/orders `
-  -ContentType "application/json" `
-  -Body '{"customerEmail":"buyer@example.com","items":[{"sku":"SKU-100","quantity":8,"unitPrice":19.99}]}'
 ```
- 
-If you want to use `curl.exe` directly on Windows instead, swap the single
-quotes for double quotes and escape the inner double quotes:
- 
-```cmd
-curl.exe -X POST http://localhost:8080/api/inventory/products -H "Content-Type: application/json" -d "{\"sku\":\"SKU-100\",\"name\":\"Wireless Mouse\",\"price\":19.99,\"quantity\":10,\"reorderThreshold\":3}"
+
+### Upgrading a database created before v2
+
+The schema is managed by `ddl-auto: update`, which adds new columns and indexes but is **quietly
+best-effort about unique constraints** — Hibernate's default strategy swallows the failure, so the service
+can boot with the pre-check and nothing behind it. On a pre-existing volume, run these once (or just
+`docker compose down -v` and start clean):
+
+```sql
+-- order_db
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS idempotency_key varchar(255);
+ALTER TABLE orders ADD CONSTRAINT uk_orders_idempotency_key UNIQUE (idempotency_key);
+
+-- notification_db
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS event_id varchar(255);
+ALTER TABLE notifications ADD CONSTRAINT uk_notifications_event_id UNIQUE (event_id);
 ```
- 
-**Then, on any OS:**
- 
+
+`outbox_events` is a new table and is created outright, constraints included. `order_items.unit_price` and
+`idx_order_items_order_id` are added by `ddl-auto` without help.
+
+### Running the tests
+
 ```bash
-# stop inventory-service and repeat the order call to watch the circuit breaker trip
-docker compose stop inventory-service
-```
- 
-## Running the tests
- 
-```bash
-mvn test                                # whole suite
-mvn verify                              # same tests, plus packaging
-mvn -pl inventory-service test          # one module
+mvn test                                 # whole suite
+mvn verify                               # same tests, plus packaging — what CI runs
+mvn -pl inventory-service test           # one module
 mvn -pl order-service test -Dtest=OutboxRelayPostgresKafkaIntegrationTest
 ```
- 
-**Docker Desktop must be running.** Three classes start real containers, because what they verify is
-database and broker behaviour rather than application logic - on H2 they would pass while production
-oversold:
- 
+
+**Docker Desktop must be running.** Five classes start real containers, because what they verify is
+database, broker and Redis behaviour rather than application logic — on H2 or an embedded fake they would
+pass while production oversold:
+
 | Test | Containers | What it pins down |
 |---|---|---|
-| `OutboxRelayPostgresKafkaIntegrationTest` (order) | Postgres 16, Kafka | `FOR UPDATE SKIP LOCKED`, which H2 cannot parse; an order placed while the broker is unreachable is still placed, and its event is delivered once the broker returns |
-| `StockReservationConcurrencyIntegrationTest` (inventory) | Postgres 16 | 20 callers race for 1 unit of stock and exactly one wins - the `@Version` optimistic lock |
-| `StockReservationIdempotencyIntegrationTest` (inventory) | Postgres 16 | one idempotency key decrements stock once, sent both sequentially and simultaneously |
- 
-Images match `docker-compose.yml` (`postgres:16-alpine`, `confluentinc/cp-kafka:7.5.3`), and
-Testcontainers' Ryuk sidecar removes the containers when the JVM exits. Without Docker these classes
-**skip** rather than fail, so the rest of the suite still runs.
- 
-Everything else needs nothing external: Mockito unit tests, `@WebMvcTest` slices, `@SpringBootTest` on
-H2, `@EmbeddedKafka` listener tests, and a WireMock-backed circuit-breaker test.
- 
-There is no failsafe plugin and no `*IT` naming - every test runs under surefire, so `mvn test` and
-`mvn verify` run the same set. `mvn test` therefore starts containers too; that is the trade-off for
-having one obvious way to run the suite.
- 
+| `OutboxRelayPostgresKafkaIntegrationTest` (order) | Postgres 16, Kafka | `FOR UPDATE SKIP LOCKED`, which H2 cannot parse; an order placed while the broker is unreachable is still placed, and its event arrives once the broker is back |
+| `StockReservationConcurrencyIntegrationTest` (inventory) | Postgres 16 | 20 callers race for 1 unit and exactly one wins — the `@Version` lock |
+| `StockReservationIdempotencyIntegrationTest` (inventory) | Postgres 16 | one key decrements stock once, sequentially and simultaneously, and replays the price as of the reservation |
+| `GatewayAuthIntegrationTest` (gateway) | Redis 7 | roles, expiry, bad signatures, spoofed `X-User-Id`, `/reserve` denied even for ADMIN, actuator locked down |
+| `GatewayRateLimitIntegrationTest` (gateway) | Redis 7 | a caller over the limit gets 429 with the rate-limit headers, and each user has their own bucket |
+
+Images match `docker-compose.yml` (`postgres:16-alpine`, `confluentinc/cp-kafka:7.5.3`, `redis:7-alpine`),
+and Testcontainers' Ryuk sidecar removes them when the JVM exits. Without Docker these classes **skip**
+rather than fail — see the limitation above. Everything else needs nothing external: Mockito unit tests,
+`@WebMvcTest` slices, `@SpringBootTest` on H2, `@EmbeddedKafka` listener tests, the WireMock-backed
+resilience tests, and the Redis-down fail-open test.
+
+There is no failsafe plugin and no `*IT` naming — every test runs under surefire, so `mvn test` and
+`mvn verify` run the same set, and `mvn test` starts containers too. That is the trade-off for having one
+obvious way to run the suite.
+
+#### Docker Engine 29: why `docker-java.properties` exists
+
+`api-gateway`, `inventory-service` and `order-service` each carry a one-line
+`src/test/resources/docker-java.properties` pinning `api.version=1.44`. Without it **no container
+starts**, and the symptom is misleading: the tests report as *skipped*, which looks like Docker simply not
+running. The Testcontainers version the Spring Boot 3.2.5 BOM manages (1.19.7) does not negotiate an API
+version — `DockerClientProviderStrategy` falls back to a hard-coded `VERSION_1_32`, and Docker Engine 29
+raised its *minimum* to 1.40, so `/v1.32/info` returns HTTP 400 and Testcontainers concludes there is no
+Docker environment. 1.44 is the ceiling the shaded docker-java 3.3.6 knows. This is test-scoped
+configuration rather than a dependency change, and it can be deleted once the managed Testcontainers
+version moves past 1.19.x.
+
 ### Load and resilience scripts
 
 Two Python scripts in the repo root drive the running stack from outside. They are not part of
-`mvn test` - they need the whole system up, and they exist to produce numbers rather than to pass.
+`mvn test` — they need the whole system up, and they exist to produce numbers.
 
 ```bash
-docker compose up --build          # all services, in another terminal
+docker compose up --build          # in another terminal
 pip install requests
 ```
 
 | Command | What it proves |
 |---|---|
-| `python ims_load_test.py idempotency` | 10 concurrent `/reserve` calls sharing one `idempotencyKey` decrement stock once, not ten times |
-| `python ims_load_test.py concurrency` | 20 orders race for 10 units; exactly 10 are CONFIRMED, the rest REJECTED, stock lands at 0 |
-| `python ims_load_test.py flash [n_orders] [starting_qty]` | flash sale: 500 concurrent single-unit orders against 100 units. Reports CONFIRMED / REJECTED / FAILED / 429 and asserts `CONFIRMED + final stock == 100` with stock never negative. Exits non-zero if either assertion fails |
-| `python ims_load_test.py circuit-breaker` | response latency before and after the breaker opens (stop `inventory-service` first - see the docstring) |
-| `python ims_cb_experiment.py --feign-cb false --run 1` | open-circuit latency, measured only while actuator reports the breaker strictly OPEN. Prints one JSON object; the runs collected so far are in `cb_experiment_results_v2.json`. Needs the `CB-VERIFY01` product to exist already, which now takes an admin token to create |
+| `python ims_load_test.py idempotency` | 10 concurrent `/reserve` calls sharing one key decrement stock once, not ten times |
+| `python ims_load_test.py concurrency` | 20 orders race for 10 units; 10 end `CONFIRMED`, the rest `REJECTED`, stock lands at 0 |
+| `python ims_load_test.py flash [n_orders] [starting_qty]` | 500 concurrent single-unit orders against 100 units. Reports `CONFIRMED` / `REJECTED` / `FAILED` / 429 and latency, and asserts `CONFIRMED + final stock == starting stock` with stock never negative. Exits non-zero if either assertion fails |
+| `python ims_load_test.py circuit-breaker` | latency before and after the breaker opens (stop `inventory-service` first — see the docstring) |
+| `python ims_cb_experiment.py --feign-cb false --run 1` | open-circuit latency, measured only while actuator reports the breaker strictly `OPEN`. Prints one JSON object; the runs collected so far are in `cb_experiment_results_v2.json`. Needs the `CB-VERIFY01` product to exist, which now takes an admin token to create |
 
-**The scripts log themselves in.** Every gateway route requires a JWT, so each scenario calls the
-demo `POST /auth/login` first - as `admin1` to create a product, as `customer1` to place orders.
-The defaults match the demo users in `api-gateway/src/main/resources/application.yml`; override them
-with `IMS_ADMIN_USER` / `IMS_ADMIN_PASSWORD` / `IMS_CUSTOMER_USER` / `IMS_CUSTOMER_PASSWORD` if you
-changed `CUSTOMER_PASSWORD_HASH` or `ADMIN_PASSWORD_HASH`.
+**The scripts log themselves in**, since every gateway route needs a JWT: as `admin1` to create products,
+as `customer1` to place orders. Override the credentials with `IMS_ADMIN_USER` / `IMS_ADMIN_PASSWORD` /
+`IMS_CUSTOMER_USER` / `IMS_CUSTOMER_PASSWORD` if you changed the hashes.
 
-**Raise the rate limiter before `flash`.** The limiter's bucket is keyed on the caller
-(`UserOrIpKeyResolver`), so all 500 orders of a flash run share one bucket, and at the default 20
-requests/second with a burst of 40 roughly 440 of them come back `429` without ever reaching
-order-service. The run still passes its assertions - a throttled request never touched stock - but
-it stops being a test of concurrent stock reservation. The gateway reads these as environment
-variables, so the container has to be recreated for a change to apply:
+**Raise the rate limit before `flash`.** The bucket is keyed on the caller and all 500 orders share one,
+so at the default 20 req/s (burst 40) roughly 440 come back `429` without ever reaching order-service.
+The run still passes its assertions — a throttled request never touched stock — but it stops being a test
+of concurrent reservation. The gateway reads these as environment variables, so the container has to be
+recreated for a change to apply:
 
 ```powershell
-# PowerShell
 $env:RATE_LIMIT_REPLENISH_RATE=2000; $env:RATE_LIMIT_BURST_CAPACITY=4000
 docker compose up -d --force-recreate api-gateway
 ```
 
 ```bash
-# bash / Git Bash
 RATE_LIMIT_REPLENISH_RATE=2000 RATE_LIMIT_BURST_CAPACITY=4000 \
   docker compose up -d --force-recreate api-gateway
 ```
 
-Drop the variables and recreate the gateway again to put the production-ish limit back. Leaving the
-limiter at 20/s and watching the `429` count climb is itself a useful demo - just not at the same
-time as the oversell test.
+Drop the variables and recreate the gateway again to put the production-ish limit back. Leaving it at
+20/s and watching the `429` count climb is a useful demo in its own right — just not at the same time as
+the oversell test.
 
-**Two calls deliberately skip the gateway**, both on `localhost:8081`:
-`reserve_stock_direct` (the gateway neither routes nor permits `/api/inventory/reserve` - it is the
-internal saga endpoint order-service reaches over Feign) and `get_stock`, which reads the stock the
-assertions are made against. A measurement must not be able to fail because the burst it just fired
-emptied its own rate-limit bucket.
+**Two calls deliberately skip the gateway**, both on `localhost:8081`: `reserve_stock_direct` (the gateway
+neither routes nor permits `/api/inventory/reserve`, which is the internal saga endpoint order-service
+reaches over Feign) and `get_stock`, which reads the stock the assertions are made against. A measurement
+must not be able to fail because the burst it just fired emptied its own rate-limit bucket.
 
-#### Results
+## Results
 
-Filled in from real runs - paste the raw script output under the table rather than summarising it.
+Filled in from real runs. Paste the raw script output under the table rather than summarising it.
 
 | Date | Mode | Orders | Stock | CONFIRMED | REJECTED | FAILED | 429 | Final stock | Assertions | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -271,144 +434,17 @@ Filled in from real runs - paste the raw script output under the table rather th
 |  | concurrency |  |  |  |  |  |  |  |  |  |
 |  | idempotency |  |  |  |  |  |  |  |  |  |
 
+```text
+(paste the `python ims_load_test.py flash` output here)
+```
+
 Open-circuit latency runs live in `cb_experiment_results_v2.json` (and the older
 `cb_experiment_results.json`, whose key names predate the current script).
 
-### Docker Engine 29: why `docker-java.properties` exists
- 
-`inventory-service` and `order-service` each carry a one-line
-`src/test/resources/docker-java.properties` pinning `api.version=1.44`. Without it **no container
-starts**, and the symptom is misleading: the Testcontainers tests report as *skipped*, which looks like
-Docker simply not running.
- 
-The Testcontainers version the Spring Boot 3.2.5 BOM manages (1.19.7) does not negotiate an API version.
-`DockerClientProviderStrategy.getClientForConfig` falls back to a hard-coded
-`RemoteApiVersion.VERSION_1_32` when none is configured, and Docker Engine 29 raised its *minimum*
-supported API version to 1.40 - so `/v1.32/info` comes back HTTP 400 and Testcontainers concludes there
-is no Docker environment. 1.44 is the ceiling: the highest version the shaded docker-java 3.3.6 knows.
-This is test-scoped configuration rather than a dependency change, and it can be deleted once the
-managed Testcontainers version moves past 1.19.x.
- 
 ## Where to get help
- 
-- Open a GitHub Issue on this repo for bugs or questions
-- Check `actuator/health` on the relevant service for live circuit-breaker state
-- The `docs/` in each service's package structure (`controller/service/repository/...`)
-  maps 1:1 to responsibility, so start in the package matching the symptom
- 
-## Decisions made, and what I'd change
- 
- 
-**Bugs found under load, not assumed away**
- 
-- *Idempotency race*: firing 10 concurrent requests with the same idempotency
-  key showed all 10 could pass the "does this key exist?" check before any
-  committed. One insert won, 9 hit a raw Postgres `23505` and returned `500`.
-  Fixed by catching the constraint violation, re-querying, and returning the
-  winner's result with a short bounded retry. Verified: 30/30 clean `200`s
-  across 3 runs.
-- *Circuit breaker looked open but wasn't fast*: breaker correctly tripped
-  `OPEN`, but calls still took ~940ms. The real cause was aspect order.
-  Resilience4j's default stacks `@Retry` outside `@CircuitBreaker`, so the
-  *inner* breaker's fallback fired on the very first failed attempt and
-  converted the real exception into `InventoryServiceUnavailableException`
-  before retry could make a second attempt. A first pass treated the symptom by
-  adding that exception type (plus `CallNotPermittedException`) to retry's
-  `ignore-exceptions`: latency dropped to ~40–80ms, but retries were now
-  silently dead — the outer retry only ever saw the fallback's already-ignored
-  exception, so a transient 500 got exactly 1 attempt instead of 3. An initial
-  theory — a second competing circuit breaker from Spring Cloud OpenFeign — was
-  tested and ruled out (latency was identical either way); that wrapper is now
-  off by default anyway, since it was redundant next to the explicit
-  annotations. Real fix: invert the aspect order
-  (`circuit-breaker-aspect-order: 1`, `retry-aspect-order: 2`) so the breaker
-  wraps the retry. Retry now gets all 3 attempts against the real downstream,
-  the breaker sees one outcome per logical call, and when it is open it rejects
-  before the retry layer is entered at all — so retry's `ignore-exceptions`
-  needs only the two business exceptions.
-- *Insufficient stock was reported as FAILED, not REJECTED*: found while writing
-  the integration test for the above. Listing an exception under
-  `ignore-exceptions` keeps it out of the breaker's statistics but does **not**
-  stop Resilience4j from invoking the fallback for it, so a 409 from
-  inventory-service was being wrapped into
-  `InventoryServiceUnavailableException` — turning a business rejection into an
-  infrastructure failure. Fix: the fallback rethrows
-  `InsufficientStockException`/`ProductNotFoundException` unchanged. Covered by
-  `InventoryResilienceIntegrationTest`, which pins all of this down against
-  WireMock: 409 → `REJECTED` after exactly 1 call, 500 → `FAILED` after exactly
-  3, and an open breaker → `FAILED` in under 100ms with 0 calls downstream.
-- *Compensating restock was retried*: the same "inventoryService" instance
-  backed both `reserveStock` and `restock`, so inverting the aspect order would
-  have given the compensation call a working 3-attempt retry too. Releasing
-  stock is not idempotent — a retry after a lost response would release it twice
-  — so `@Retry` was dropped from `restock`, keeping only the breaker and its
-  best-effort logging fallback.
-- *Every Kafka event was quietly dead-lettered*: `JsonSerializer` stamps the
-  **producer's** fully-qualified class name into the `__TypeId__` header, but
-  notification-service keeps its own copy of each contract (see the
-  duplicated-DTO trade-off below) and trusts only `com.ims.notification.event`.
-  Every order and low-stock event therefore failed type resolution with `The
-  class 'com.ims.order.event.OrderEvent' is not in the trusted packages`, and
-  because `DefaultErrorHandler` treats a `DeserializationException` as
-  non-retryable, each one went to `<topic>.DLT` on the first attempt. Not a
-  single notification was ever persisted. The dead-letter machinery worked
-  exactly as designed, which is precisely why nobody noticed: nothing wedged,
-  nothing threw, the events just drained into a topic no one was reading. Missed
-  in tests because the only consumer coverage called the listener method
-  directly, never crossing a serializer. Fix: both producers publish a logical
-  token (`order-event`, `low-stock-event`) via `spring.json.type.mapping`, and
-  the consumer maps those tokens to its own records — a mapped token is resolved
-  before the trusted-packages check, so the topic contract is now a name both
-  sides agree on rather than one service's package layout. Pinned by
-  `OrderEventKafkaTypeMappingIntegrationTest`, which publishes through a producer
-  configured identically to order-service's and asserts the `Notification` row,
-  plus a second case that replays the old raw-class-name header and asserts it
-  lands on `order-events.DLT` carrying that exact exception.
 
-  
-**Deliberate trade-offs**
- 
-- *Duplicated DTOs instead of a shared library between order-service and
-  inventory-service.* Costs a bit of manual sync when the contract changes;
-  buys true independent deployability. I'd revisit this only if the two
-  services started changing their shared contract often enough that drift
-  became a real bug source.
-- *Manual saga instead of a distributed transaction.* Simpler to reason about
-  and debug than 2PC, but compensation logic is hand-written per failure mode.
-  This doesn't scale past a handful of steps — a real orchestrator (e.g.
-  Temporal, or an outbox-pattern-based saga) would be the next step if order
-  flows grew more complex than "reserve N items, roll back on failure."
-- *Order placement always returns 201, even on failure to fulfill.* Correct
-  API design here, but it pushes an obligation onto every client to check
-  `status` — easy to forget. Worth adding a webhook/callback option so
-  clients aren't required to poll or inspect the body.
-  
-  
-**What I'd change with more time**
- 
-- **Single point of failure at the gateway.** Right now there's one
-  `api-gateway` instance. If it dies, the whole system is unreachable from
-  outside, regardless of how healthy the three business services are. This
-  is the biggest gap in the "resilience" story as it stands — everything
-  downstream is protected, but the front door isn't.
-- **Move to Kubernetes instead of Docker Compose.** Compose is fine for a demo
-  running on one machine, but it doesn't restart a crashed container onto a
-  healthy node, doesn't do rolling deploys, and doesn't scale a service
-  without manual `docker compose up --scale`. K8s gives readiness/liveness
-  probes, auto-restart, and horizontal scaling for free — closer to how this
-  would actually run in production.
-- **Run multiple `api-gateway` replicas behind a load balancer**, instead of
-  one instance. In K8s this is close to free: a `Deployment` with
-  `replicas: 3` plus a `Service` in front gives you both the multiple
-  instances and the load balancing in one move — they're not really two
-  separate features to build, just one decision (replica count) plus the
-  Service object K8s already gives you. Client-side, Eureka already does
-  load balancing across `inventory-service`/`order-service`/
-  `notification-service` instances; the gap is specifically that the gateway
-  itself was never made redundant the same way.
-- Worth being honest about scope here: none of this is needed to demonstrate
-  the resilience patterns this project is actually about (circuit breaker,
-  idempotency, saga, etc.). It matters if the goal shifts from "show these
-  patterns work" to "this could hold production traffic" — those are
-  different bars, and right now this project clears the first one, not the
-  second.
+- Open a GitHub issue on this repo.
+- `GET /actuator/health` on `order-service` (8082) shows live circuit-breaker state. `health,info,metrics`
+  are exposed on the business services; only `health` on the gateway.
+- Each service's package layout (`controller` / `service` / `repository` / `client` / `event` /
+  `exception`) maps 1:1 to responsibility, so start in the package matching the symptom.
