@@ -51,7 +51,7 @@ public class InventoryClientAdapter {
     }
 
     @SuppressWarnings("unused") // invoked reflectively by Resilience4j
-    private StockReservationResponse reserveStockFallback(StockReservationRequest request, Throwable t) {
+    StockReservationResponse reserveStockFallback(StockReservationRequest request, Throwable t) {
         // Resilience4j invokes the fallback for every exception the call throws, including the
         // ones listed under ignore-exceptions (those only stay out of the breaker's statistics).
         // So business rejections have to be rethrown as-is here, or a REJECTED order would be
@@ -64,7 +64,7 @@ public class InventoryClientAdapter {
     }
 
     @SuppressWarnings("unused") // invoked reflectively by Resilience4j
-    private void restockFallback(String sku, int quantity, Throwable t) {
+    void restockFallback(String sku, int quantity, Throwable t) {
         // A fallback that just returns is indistinguishable from success to the caller, which
         // would then mark the line item released even though the stock is still decremented
         // downstream. So this one throws: the compensation loop in OrderServiceImpl catches it,
