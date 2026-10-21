@@ -4,16 +4,38 @@ server:
 spring:
   application:
     name: api-gateway
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
   cloud:
     gateway:
       discovery:
         locator:
           enabled: false
+      # One limiter for every route. The bucket is per caller, not per route, so a future
+      # payment or cart route inherits the limit without anyone remembering to add it.
+      # 20 req/s sustained per principal is far above any human or browser page load and well
+      # below what a single inventory-service instance absorbs; burst = 2x rate gives a page that
+      # fires a dozen parallel calls some slack. All three are env-overridable so the load-test
+      # scripts can raise the ceiling without editing this file.
+      default-filters:
+        - name: RequestRateLimiter
+          args:
+            # Must stay quoted: an unquoted leading # makes this line a YAML comment, and the
+            # limiter then silently falls back to the default PrincipalNameKeyResolver.
+            key-resolver: "#{@userOrIpKeyResolver}"
+            redis-rate-limiter.replenishRate: ${RATE_LIMIT_REPLENISH_RATE:20}
+            redis-rate-limiter.burstCapacity: ${RATE_LIMIT_BURST_CAPACITY:40}
+            redis-rate-limiter.requestedTokens: ${RATE_LIMIT_REQUESTED_TOKENS:1}
       routes:
         - id: inventory-service
           uri: lb://inventory-service
           predicates:
-            - Path=/api/inventory/**
+            # /api/inventory/reserve is deliberately NOT matched: it is the internal saga endpoint
+            # that order-service calls over Feign. This is the second line of defence only -
+            # SecurityConfig denies it first, so a request gets 403 rather than 404.
+            - Path=/api/inventory/products,/api/inventory/products/**
         - id: order-service
           uri: lb://order-service
           predicates:
@@ -34,4 +56,34 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,gateway
+        include: health
+  health:
+    redis:
+      # The rate limiter fails open, so a Redis outage does not stop the gateway serving traffic.
+      # Leaving the Redis indicator on would mark the gateway DOWN and get it restarted in Step 19
+      # while it is in fact working perfectly well.
+      enabled: false
+
+ims:
+  auth:
+    jwt:
+      # No default on purpose: a missing JWT_SECRET must fail startup rather than fall back to
+      # something guessable. The dev value lives in docker-compose.yml.
+      secret: ${JWT_SECRET}
+      issuer: https://ims-gateway
+      ttl: 15m
+    # DEMO ONLY - see AuthController. Production deletes this block and validates tokens issued by
+    # an identity provider. These are BCrypt hashes of "customer-demo-pw" and "admin-demo-pw"
+    # respectively; naming them here is harmless because the hash sits in the same repo, and it
+    # saves the next person guessing. Override both with CUSTOMER_PASSWORD_HASH /
+    # ADMIN_PASSWORD_HASH. A hash passed through docker-compose env must have its $ characters
+    # doubled, or compose interpolates them away.
+    users:
+      - username: customer1
+        password-hash: "${CUSTOMER_PASSWORD_HASH:$2a$10$7tcWJN/pRZ0jpD8lYBwDN.AmfhGZLyT3vGSJHmfZzyZUYPjfQNH/y}"
+        roles:
+          - CUSTOMER
+      - username: admin1
+        password-hash: "${ADMIN_PASSWORD_HASH:$2a$10$e07X/ZTUIWMe1necciN9sevP5MFhot5cM/YAI58X6j7Kwc7odh2Ne}"
+        roles:
+          - ADMIN

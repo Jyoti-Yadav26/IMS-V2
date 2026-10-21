@@ -1,0 +1,9 @@
+# Layered on top of gateway-it + ratelimit-it for the fail-open test. The host and port come from
+# @DynamicPropertySource (highest precedence) and point at a closed local port, so Lettuce gets a
+# fast connection refusal rather than hanging. The short timeouts are belt and braces: if the
+# connection ever stalls instead of being refused, the test fails quickly instead of hanging.
+spring:
+  data:
+    redis:
+      connect-timeout: 250ms
+      timeout: 250ms

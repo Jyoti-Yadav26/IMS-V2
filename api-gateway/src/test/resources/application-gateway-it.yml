@@ -1,0 +1,55 @@
+# Base profile for the gateway integration tests.
+#
+# Deliberately a PROFILE and not src/test/resources/application.yml: a test application.yml would
+# shadow the real one on the classpath, and the tests would then exercise a copied route table and
+# a copied security config instead of the production ones. Everything here is an override on top of
+# src/main/resources/application.yml.
+
+spring:
+  cloud:
+    # The gateway routes with lb://, so the downstream services are registered as discovery
+    # instances pointing at WireMock. Same trick as order-service's application-resilience-it.yml.
+    discovery:
+      client:
+        simple:
+          instances:
+            inventory-service:
+              - uri: http://localhost:${wiremock.server.port}
+            order-service:
+              - uri: http://localhost:${wiremock.server.port}
+            notification-service:
+              - uri: http://localhost:${wiremock.server.port}
+
+eureka:
+  client:
+    enabled: false
+
+# Resolves the ${RATE_LIMIT_*} placeholders in the production application.yml. Deliberately huge so
+# that no authorisation test can ever see a 429; the rate-limit behaviour has its own profile.
+RATE_LIMIT_REPLENISH_RATE: 5000
+RATE_LIMIT_BURST_CAPACITY: 10000
+
+ims:
+  auth:
+    jwt:
+      # Must stay in sync with JwtTestSupport.SECRET. Also satisfies the ${JWT_SECRET} placeholder
+      # in the production application.yml, which has no default.
+      secret: it-only-ims-gateway-hs256-secret-key-0123456789
+      issuer: https://ims-gateway
+      ttl: 15m
+    # BCrypt hashes of "it-customer-pw" and "it-admin-pw" (see AuthLogin tests).
+    users:
+      - username: customer1
+        password-hash: "$2a$10$iuUFv6SQgYrObpgO.MsQUeYaNuY769nl6WJykUAcoMdIznBIQD5tK"
+        roles:
+          - CUSTOMER
+      - username: admin1
+        password-hash: "$2a$10$vTup8mpQW2u/45dooWVy9OvAPKeJeDgJOPIQW9ob7jAytDPCQKmnq"
+        roles:
+          - ADMIN
+
+logging:
+  level:
+    # The fail-open path inside RedisRateLimiter logs at DEBUG; without this the Redis-down test
+    # gives no evidence in the build output of why it passed.
+    org.springframework.cloud.gateway.filter.ratelimit: DEBUG

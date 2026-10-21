@@ -1,0 +1,4 @@
+# Tiny bucket so the limiter can actually be driven over the edge in a test. Layered on top of
+# application-gateway-it.yml, overriding only the two placeholder values it sets.
+RATE_LIMIT_REPLENISH_RATE: 1
+RATE_LIMIT_BURST_CAPACITY: 2
